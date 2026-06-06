@@ -1,33 +1,18 @@
+import gc
 import io
-import json
 import logging
-import os
-import shutil
-import zipfile
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Set
-
 import pandas as pd
 import requests
+import zipfile
+from datetime import datetime
+from typing import Dict, List, Optional, Set
 
-from logger import setup_logger
-
-
-class Config:
-    """Quản lý tập trung toàn bộ cấu hình và hằng số của hệ thống."""
-
-    URL_CAFEF: str = "https://cafef1.mediacdn.vn/data/ami_data/"
-    NETWORK_TIMEOUT: int = 30
-    INPUT_BASE_DIR: str = "tmp"
-    CHUNK_SIZE: int = 150000
-    PRICE_MULTIPLIER: int = 1000
-    DEFAULT_LOGGER_NAME: str = "ETL_Pipeline"
-
-    # Định nghĩa cấu trúc cột cố định để tái sử dụng (DRY)
-    BASE_COLUMNS: List[str] = ["symbol", "trading_date", "open", "high", "low", "close", "total_volume"]
+from config import Config
+from storages import Storage
+from utils import normalize_exchange, setup_logger
 
 
-class CafeFDownloader:
+class Downloader:
     """Chuyên trách việc giao tiếp mạng, tải tệp và trích xuất luồng dữ liệu từ CafeF."""
 
     def __init__(self, logger: logging.Logger) -> None:
@@ -88,7 +73,7 @@ class CafeFDownloader:
         return None
 
 
-class CafeFDataProcessor:
+class DataProcessor:
     """Chuyên trách việc làm sạch, biến đổi và tối ưu hóa dữ liệu chứng khoán."""
 
     def __init__(self, logger: logging.Logger) -> None:
@@ -113,47 +98,25 @@ class CafeFDataProcessor:
             self.logger.warning("⚠️ [CafeF] Không tìm thấy file 'blacklist.txt'. Bỏ qua lọc blacklist.")
             return set()
 
-    def _normalize_exchange(self, file_name: str) -> str:
-        """Nhận diện và chuẩn hóa tên sàn giao dịch dựa trên tên tệp CSV.
-
-        Args:
-            file_name: Tên tệp tin CSV nằm trong tệp zip.
-
-        Returns:
-            Tên sàn giao dịch đã chuẩn hóa ('HoSE', 'HNX', 'UPCoM', hoặc 'Unknown').
-        """
-        clean_code: str = str(file_name).strip().upper()
-        if "HSX" in clean_code or "HOSE" in clean_code:
-            return "HoSE"
-        if "UPCOM" in clean_code:
-            return "UPCoM"
-        if "HNX" in clean_code:
-            return "HNX"
-        return "Unknown"
-
-    def get_column_names(self, suffix: str, include_exchange: bool = True) -> List[str]:
+    def _get_column_names(self, include_exchange: bool = True) -> List[str]:
         """Tạo danh bạ tên cột động dựa trên hậu tố raw/adj.
 
         Args:
-            suffix: Hậu tố phân loại dữ liệu ('raw' hoặc 'adj').
             include_exchange: Có bao gồm cột 'exchange' ở vị trí thứ 2 hay không.
 
         Returns:
             Danh sách chuỗi tên các cột dữ liệu theo đúng thứ tự.
         """
-        cols: List[str] = [
-            f"{col}_{suffix}" if col not in ["symbol", "trading_date"] else col for col in Config.BASE_COLUMNS
-        ]
+        cols: List[str] = ["symbol", "trading_date", "open_price", "high_price", "low_price", "close_price", "total_volume"]
         if include_exchange:
-            cols.insert(1, "exchange")
+            cols.append("exchange")
         return cols
 
-    def _clean_chunk(self, chunk: pd.DataFrame, suffix: str, exchange_name: str) -> pd.DataFrame:
+    def _clean_chunk(self, chunk: pd.DataFrame, exchange_name: str) -> pd.DataFrame:
         """Làm sạch sâu dữ liệu của một phân đoạn (Chunk) bằng toán tử Vectorization.
 
         Args:
             chunk: Phân đoạn DataFrame thô vừa đọc từ CSV.
-            suffix: Hậu tố tên cột ('raw' hoặc 'adj').
             exchange_name: Tên sàn giao dịch của phân đoạn này.
 
         Returns:
@@ -167,32 +130,41 @@ class CafeFDataProcessor:
         # Khắc phục SettingWithCopyWarning bằng cách tạo một bản sao độc lập dữ liệu
         chunk = chunk.copy()
 
-        # Chuẩn hóa văn bản bằng Vectorization
+        # 1. Chuẩn hóa chuỗi và ép kiểu tối ưu danh mục ngay lập tức
         chunk["symbol"] = chunk["symbol"].astype(str).str.strip().str.upper()
-        chunk["exchange"] = exchange_name
 
-        # Lọc sát ván với Blacklist bằng toán tử hashset siêu tốc O(1)
+        # Định nghĩa sẵn các danh mục để tránh Pandas tự suy luận dynamic theo từng chunk
+        chunk["exchange"] = pd.Categorical(
+            [exchange_name] * len(chunk),
+            categories=["HoSE", "HNX", "UPCoM", "Unknown"]
+        )
+
         if self.blacklist:
             chunk = chunk[~chunk["symbol"].isin(self.blacklist)]
             if chunk.empty:
                 return chunk
 
-        # Đồng bộ đơn vị giá của CafeF (Nhân vector không dùng vòng lặp)
-        price_cols: List[str] = [f"{p}_{suffix}" for p in ["open", "high", "low", "close"]]
+        # 2. Đồng bộ đơn vị giá (Vectorization)
+        price_cols: List[str] = ["open_price", "high_price", "low_price", "close_price"]
         chunk[price_cols] *= Config.PRICE_MULTIPLIER
 
-        # Lọc song song tất cả các lỗi logic toán học của biên độ giá
+        # 3. Ép kiểu dữ liệu số về mức dung lượng thấp hơn (Downcasting)
+        # Giá chứng khoán Việt Nam sau nhân 1000 không vượt quá mức Float32, Volume không vượt quá Int32
+        chunk[price_cols] = chunk[price_cols].astype("float32")
+        chunk[f"total_volume"] = chunk[f"total_volume"].astype("int32")
+
+        # 4. Lọc lỗi logic toán học
         valid_mask: pd.Series = (
             (chunk[price_cols] > 0).all(axis=1)
-            & (chunk[f"total_volume_{suffix}"] >= 0)
-            & (chunk[f"high_{suffix}"] >= chunk[f"open_{suffix}"])
-            & (chunk[f"high_{suffix}"] >= chunk[f"close_{suffix}"])
-            & (chunk[f"low_{suffix}"] <= chunk[f"open_{suffix}"])
-            & (chunk[f"low_{suffix}"] <= chunk[f"close_{suffix}"])
+            & (chunk[f"total_volume"] >= 0)
+            & (chunk[f"high_price"] >= chunk[f"open_price"])
+            & (chunk[f"high_price"] >= chunk[f"close_price"])
+            & (chunk[f"low_price"] <= chunk[f"open_price"])
+            & (chunk[f"low_price"] <= chunk[f"close_price"])
         )
         return chunk[valid_mask]
 
-    def process_zip_content(self, zip_data: io.BytesIO, suffix: str) -> pd.DataFrame:
+    def process_zip_content(self, zip_data: io.BytesIO) -> pd.DataFrame:
         """Đọc phân đoạn, làm sạch và hợp nhất toàn bộ nội dung bên trong file zip.
 
         Args:
@@ -202,21 +174,20 @@ class CafeFDataProcessor:
         Returns:
             DataFrame tổng hợp đã được làm sạch và tối ưu hóa bộ nhớ.
         """
-        cols_order: List[str] = self.get_column_names(suffix, include_exchange=False)
-        final_cols_order: List[str] = self.get_column_names(suffix, include_exchange=True)
+        cols_order: List[str] = self._get_column_names(include_exchange=False)
+        final_cols_order: List[str] = self._get_column_names(include_exchange=True)
 
-        # Sử dụng float64 tạm thời cho volume để tối ưu hóa tốc độ parse của engine C trong CsvReader
+        # Định nghĩa kiểu dữ liệu tối giản lúc đọc từ CSV gốc
         csv_dtypes: Dict[str, str] = {
             "symbol": "str",
-            f"open_{suffix}": "float32",
-            f"high_{suffix}": "float32",
-            f"low_{suffix}": "float32",
-            f"close_{suffix}": "float32",
-            f"total_volume_{suffix}": "float64",
+            f"open_price": "float32",
+            f"high_price": "float32",
+            f"low_price": "float32",
+            f"close_price": "float32",
+            f"total_volume": "float32",
         }
 
         dfs: List[pd.DataFrame] = []
-
         with zipfile.ZipFile(zip_data) as z:
             csv_files: List[str] = [name for name in z.namelist() if name.endswith(".csv")]
             if not csv_files:
@@ -224,12 +195,14 @@ class CafeFDataProcessor:
                 return pd.DataFrame(columns=final_cols_order)
 
             for name in csv_files:
-                self.logger.info(f"📂 Đang trích xuất và xử lý stream sàn: [yellow]{name}[/yellow]")
-                detected_exchange: str = self._normalize_exchange(name)
+                self.logger.info(f"📂 Đang trích xuất & xử lý stream sàn: [yellow]{name}[/yellow]")
+                detected_exchange: str = normalize_exchange(name)
 
                 with z.open(name) as f:
                     text_stream = io.TextIOWrapper(f, encoding="utf-8")
-                    chunks = pd.read_csv(
+
+                    # Đọc trực tiếp bằng Generator để tránh tích lũy chunk rỗng
+                    for chunk in pd.read_csv(
                         text_stream,
                         header=0,
                         names=cols_order,
@@ -239,151 +212,34 @@ class CafeFDataProcessor:
                         engine="c",
                         on_bad_lines="skip",
                         chunksize=Config.CHUNK_SIZE,
-                    )
-
-                    # List Comprehension kết hợp generator lọc bỏ dataframe rỗng cực nhanh
-                    clean_chunks = (self._clean_chunk(chunk, suffix, detected_exchange) for chunk in chunks)
-                    dfs.extend([df for df in clean_chunks if not df.empty])
+                    ):
+                        # List Comprehension kết hợp generator lọc bỏ dataframe rỗng cực nhanh
+                        clean_df = self._clean_chunk(chunk, detected_exchange)
+                        if not clean_df.empty:
+                            dfs.append(clean_df)
 
         if not dfs:
             return pd.DataFrame(columns=final_cols_order)
 
-        self.logger.info("🧱 Đang gộp các phân đoạn dữ liệu lịch sử...")
+        self.logger.info("🧱 Đang gộp các phân đoạn dữ liệu lịch sử và tối ưu RAM...")
+
+        # Gộp dữ liệu (Lúc này các chunk đều đã rất nhẹ do áp dụng categorical & downcast từ trước)
         result_df: pd.DataFrame = pd.concat(dfs, ignore_index=True)
 
-        # Ép kiểu dữ liệu tối ưu bộ nhớ (Memory Optimization)
-        result_df["exchange"] = result_df["exchange"].astype("category")
-        result_df[f"total_volume_{suffix}"] = result_df[f"total_volume_{suffix}"].astype("int64")
+        # Giải phóng mảng tạm lập tức nhằm tối ưu hóa bộ nhớ cho các bước xử lý sau
+        del dfs
+        gc.collect()
 
-        # Drop trùng lặp toàn cục dựa trên cặp khóa chính (Primary Key)
-        result_df = result_df.drop_duplicates(subset=["symbol", "trading_date"], keep="last")
+        # Đảm bảo tính toàn vẹn của kiểu dữ liệu sau khi gộp
+        result_df["exchange"] = result_df["exchange"].astype(
+            pd.CategoricalDtype(categories=["HoSE", "HNX", "UPCoM", "Unknown"])
+        )
+
+        # Sắp xếp và loại bỏ trùng lặp (Giữ lại bản ghi cuối cùng của ngày)
+        result_df.sort_values(by=["symbol", "trading_date"], inplace=True, ignore_index=True)
+        result_df.drop_duplicates(subset=["symbol", "trading_date"], keep="last", inplace=True)
 
         return result_df[final_cols_order]
-
-
-class CafeFStorage:
-    """Chuyên trách việc lưu trữ dữ liệu an toàn ra đĩa cứng (Parquet, JSON)."""
-
-    def __init__(self, logger: logging.Logger) -> None:
-        """Khởi tạo bộ lưu trữ dữ liệu.
-
-        Args:
-            logger: Đối tượng Logger dùng để ghi nhận tiến trình.
-        """
-        self.logger: logging.Logger = logger
-
-    def save_parquet(self, df: pd.DataFrame, date_ref: datetime, is_raw: bool = True) -> None:
-        """Ghi dữ liệu nén Parquet áp dụng cơ chế Staging an toàn (Atomic Write).
-
-        Args:
-            df: DataFrame dữ liệu lịch sử cần ghi dữ liệu.
-            date_ref: Mốc thời gian của tệp dữ liệu.
-
-        Raises:
-            Exception: Phát sinh khi có lỗi I/O hoặc ghi tệp đĩa cứng thất bại.
-        """
-        if df is None or df.empty:
-            return
-
-        output_dir: str = os.path.join(Config.INPUT_BASE_DIR, "historical")
-        staging_dir: str = os.path.join(Config.INPUT_BASE_DIR, "historical_staging_tmp")
-
-        # Reset thư mục tạm
-        if os.path.exists(staging_dir):
-            shutil.rmtree(staging_dir)
-        os.makedirs(staging_dir, exist_ok=True)
-
-        try:
-            suffix: str = "raw" if is_raw else "adj"
-            file_name: str = f"historical_{suffix}_upto_{date_ref.strftime('%Y%m%d')}.parquet"
-            staging_file_path: str = os.path.join(staging_dir, file_name)
-
-            self.logger.info(f"💾 Đang ghi dữ liệu nén Parquet: {file_name}")
-            df_renamed = df.rename(columns={
-                f"open_{suffix}": "open",
-                f"high_{suffix}": "high",
-                f"low_{suffix}": "low",
-                f"close_{suffix}": "close",
-                f"total_volume_{suffix}": "total_volume"
-            })
-            df_renamed.to_parquet(staging_file_path, compression="snappy", index=False)
-
-            os.makedirs(output_dir, exist_ok=True)
-            target_file_path: str = os.path.join(output_dir, file_name)
-
-            if os.path.exists(target_file_path):
-                os.remove(target_file_path)
-
-            shutil.move(staging_file_path, output_dir)
-            self.logger.info(f"🎉 File lưu trữ thành công tại: {target_file_path}")
-        except Exception as e:
-            self.logger.error(f"❌ Lỗi trong quá trình ghi file Parquet: {e}")
-            raise e
-        finally:
-            if os.path.exists(staging_dir):
-                shutil.rmtree(staging_dir)
-
-    def save_checkpoint(self, df: pd.DataFrame, suffix: str) -> None:
-        """Trích xuất và lưu trạng thái thị trường EOD (Snapshot) của toàn bộ các mã chứng khoán.
-
-        Args:
-            df: DataFrame dữ liệu tổng hợp.
-            suffix: Hậu tố cột dữ liệu ('raw' hoặc 'adj') để tự động khớp tên cột động.
-        """
-        if df is None or df.empty:
-            return
-
-        self.logger.info("⚡ [Snapshot] Đang trích xuất trạng thái thị trường EOD cho TOÀN BỘ cổ phiếu...")
-
-        # Tìm ngày chạy lớn nhất toàn hệ thống bằng phép toán Vector cực nhanh O(N)
-        max_date_str: str = pd.to_datetime(df["trading_date"]).max().strftime("%Y-%m-%d")
-
-        # Tối ưu hóa Big O: Sắp xếp theo cặp khóa chính tăng dần để dòng mới nhất luôn ở cuối bản ghi của mã đó
-        df_sorted: pd.DataFrame = df.sort_values(by=["symbol", "trading_date"], ascending=[True, True])
-        df_latest: pd.DataFrame = df_sorted.drop_duplicates(subset=["symbol"], keep="last").copy()
-
-        # Tính toán giá trung bình bằng toán tử Vector hóa trên tập rút gọn (Chỉ tính trên dòng mới nhất)
-        price_cols_origin: List[str] = [f"{p}_{suffix}" for p in ["open", "high", "low", "close"]]
-        df_latest["average_price"] = df_latest[price_cols_origin].mean(axis=1).round(2)
-
-        # Đồng bộ hóa định dạng hiển thị chuỗi ngày
-        df_latest["exchange"] = df_latest["exchange"].astype(str)
-        df_latest["trading_date"] = pd.to_datetime(df_latest["trading_date"]).dt.strftime("%Y-%m-%d")
-
-        # Áp dụng Dictionary Comprehension để đổi tên cột động theo tiêu chuẩn lưu checkpoint (DRY)
-        rename_mapping: Dict[str, str] = {f"{col}_{suffix}": f"{col}_price" for col in ["open", "high", "low", "close"]}
-        rename_mapping[f"total_volume_{suffix}"] = "total_volume"
-        df_latest = df_latest.rename(columns=rename_mapping)
-
-        # Chuyển đổi sang cấu trúc dữ liệu định dạng JSON
-        target_cols: List[str] = [
-            "exchange",
-            "trading_date",
-            "open_price",
-            "high_price",
-            "low_price",
-            "close_price",
-            "average_price",
-            "total_volume",
-        ]
-        market_data_dict: Dict[str, Any] = df_latest.set_index("symbol")[target_cols].to_dict(orient="index")
-
-        final_json_structure: Dict[str, Any] = {
-            "last_successful_run": max_date_str,
-            "market_data": market_data_dict,
-        }
-
-        checkpoint_path: str = os.path.join(Config.INPUT_BASE_DIR, "latest_state.json")
-        os.makedirs(Config.INPUT_BASE_DIR, exist_ok=True)
-
-        try:
-            with open(checkpoint_path, "w", encoding="utf-8") as f:
-                json.dump(final_json_structure, f, indent=4, ensure_ascii=False)
-            self.logger.info(
-                f"💾 Đã lưu snapshot toàn bộ {len(market_data_dict)} mã thành công tại: {checkpoint_path}"
-            )
-        except Exception as e:
-            self.logger.error(f"❌ Không thể ghi file Checkpoint JSON: {e}")
 
 
 class CafeFExtractorETL:
@@ -398,9 +254,9 @@ class CafeFExtractorETL:
         self.logger: logging.Logger = setup_logger(logger_name)
 
         # Dependency Injection (SOLID: Tách biệt hoàn toàn trách nhiệm)
-        self.downloader = CafeFDownloader(self.logger)
-        self.processor = CafeFDataProcessor(self.logger)
-        self.storage = CafeFStorage(self.logger)
+        self.downloader = Downloader(self.logger)
+        self.processor = DataProcessor(self.logger)
+        self.storage = Storage(self.logger)
 
     def run(self, date_ref: datetime, is_raw: bool = True) -> Optional[pd.DataFrame]:
         """Khởi chạy toàn bộ quy trình ETL tải, xử lý và lưu trữ dữ liệu lịch sử.
@@ -423,7 +279,7 @@ class CafeFExtractorETL:
 
         try:
             # Bước 2: Phân tích, làm sạch dữ liệu
-            df: pd.DataFrame = self.processor.process_zip_content(zip_stream, suffix)
+            df: pd.DataFrame = self.processor.process_zip_content(zip_stream)
 
             if df.empty:
                 self.logger.error("🛑 Pipeline kết thúc sớm do tập dữ liệu sau khi làm sạch trống rỗng.")
@@ -432,11 +288,11 @@ class CafeFExtractorETL:
             self.logger.info(f"✅ Tải và làm sạch dữ liệu thành công! Kích thước: {df.shape}")
 
             # Bước 3: Ghi file dữ liệu nén Parquet chuyên dụng
-            self.storage.save_parquet(df, date_ref, is_raw)
+            self.storage.save_parquet(df, date_ref, suffix)
 
             # Bước 4: Lưu dữ liệu trạng thái EOD Snapshot thị trường (Chỉ áp dụng với luồng giá Raw)
             if is_raw:
-                self.storage.save_checkpoint(df, suffix)
+                self.storage.save_checkpoint(df)
 
             self.logger.info(f"🏁 Pipeline hoàn thành xuất sắc! Tổng số dòng xử lý: {df.shape[0]:,}")
             return df
