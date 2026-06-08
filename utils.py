@@ -1,6 +1,4 @@
 import logging
-import time
-from typing import Callable
 from rich.console import Console
 from rich.logging import RichHandler
 

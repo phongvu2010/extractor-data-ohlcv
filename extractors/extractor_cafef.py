@@ -46,6 +46,7 @@ class Downloader:
             backoff_factor=2, # Tăng lên 2s để giãn cách các lần retry tự động (2s, 4s, 8s)
             status_forcelist=[500, 502, 503, 504]
         )
+        self.session.mount("http://", HTTPAdapter(max_retries=retries))
         self.session.mount("https://", HTTPAdapter(max_retries=retries))
 
     def __enter__(self) -> "Downloader":
@@ -101,22 +102,27 @@ class Downloader:
             # File ZIP chuẩn luôn bắt đầu bằng cụm 'PK\x03\x04' (Hex: 50 4B 03 04)
             ZIP_MAGIC_START = b"PK\x03\x04"
 
-            # Chỉ đọc đúng 4 bytes đầu tiên từ luồng mạng để xác thực
-            first_4_bytes = next(response.iter_content(chunk_size=4), b"")
+            # Tạo iterator duy nhất từ response để đọc dữ liệu từ mạng
+            stream_iterator = response.iter_content(chunk_size=65536)
 
-            if first_4_bytes != ZIP_MAGIC_START:
+            try:
+                first_chunk = next(stream_iterator)
+            except StopIteration:
+                first_chunk = b""
+
+            if not first_chunk.startswith(ZIP_MAGIC_START):
                 self.logger.error(
-                    f"❌ [CafeF] File tải về không phải định dạng ZIP hợp lệ. Magic bytes nhận được: {first_4_bytes}"
+                    f"❌ [CafeF] File tải về không phải định dạng ZIP hợp lệ. Magic bytes nhận được: {first_chunk[:4]}"
                 )
                 return None
 
             # 3. Tiến hành tải phần còn lại khi đã xác nhận file an toàn
-            # Khởi tạo luồng BytesIO và nạp 4 bytes đã đọc trước đó vào vị trí đầu tiên
+            # Khởi tạo luồng BytesIO và nạp chunk đầu tiên đã đọc vào RAM
             zip_stream = io.BytesIO()
-            zip_stream.write(first_4_bytes)
+            zip_stream.write(first_chunk)
 
-            # Đọc cuốn chiếu các phần còn lại theo từng block 64KB để ghi vào RAM, tránh phình bộ nhớ đột ngột
-            for chunk in response.iter_content(chunk_size=65536):
+            # Đọc cuốn chiếu các phần còn lại theo từng block 64KB từ iterator hiện tại để ghi vào RAM, tránh phình bộ nhớ đột ngột
+            for chunk in stream_iterator:
                 if chunk:
                     zip_stream.write(chunk)
 
@@ -217,7 +223,7 @@ class DataProcessor:
         # 3. Ép kiểu dữ liệu số về mức dung lượng thấp hơn (Downcasting)
         # Giá chứng khoán Việt Nam sau nhân 1000 không vượt quá mức Float32, Volume không vượt quá Int32
         chunk[price_cols] = chunk[price_cols].astype("float32")
-        chunk["total_volume"] = chunk["total_volume"].astype("int32")
+        chunk["total_volume"] = chunk["total_volume"].astype("Int32")
 
         # 4. Lọc lỗi logic toán học
         valid_mask: pd.Series = (
@@ -268,25 +274,30 @@ class DataProcessor:
 
                 with z.open(name) as f:
                     with io.TextIOWrapper(f, encoding="utf-8") as text_stream:
-                        # Tối ưu: Parse trực tiếp ngày tháng tại C-Engine bằng cách chỉ định vị trí cột (index 1)
-                        chunks = pd.read_csv(
-                            text_stream,
-                            header=0,
-                            names=cols_order,
-                            dtype=csv_dtypes,
-                            engine="c",
-                            on_bad_lines="skip",
-                            chunksize=Config.CHUNK_SIZE,
-                            parse_dates=[1], 
-                            date_format="%Y%m%d"
-                        )
-                        for chunk in chunks:
-                            # List Comprehension kết hợp generator lọc bỏ dataframe rỗng cực nhanh
-                            clean_df = self._clean_chunk(chunk, detected_exchange)
-                            if not clean_df.empty:
-                                dfs.append(clean_df)
-                            # Giải phóng phân đoạn hiện tại ngay lập tức
-                            del chunk 
+                        try:
+                            # Tối ưu: Parse trực tiếp ngày tháng tại C-Engine bằng cách chỉ định vị trí cột (index 1)
+                            chunks = pd.read_csv(
+                                text_stream,
+                                header=0,
+                                names=cols_order,
+                                dtype=csv_dtypes,
+                                engine="c",
+                                on_bad_lines="skip",
+                                chunksize=Config.CHUNK_SIZE,
+                                parse_dates=[1],
+                                date_format="%Y%m%d",
+                            )
+                            for chunk in chunks:
+                                # List Comprehension kết hợp generator lọc bỏ dataframe rỗng cực nhanh
+                                clean_df = self._clean_chunk(chunk, detected_exchange)
+                                if not clean_df.empty:
+                                    dfs.append(clean_df)
+                                # Giải phóng phân đoạn hiện tại ngay lập tức
+                                del chunk
+                        except pd.errors.EmptyDataError:
+                            self.logger.warning(
+                                f"⚠️ [CafeF] Tệp CSV '{name}' trống hoặc chỉ chứa tiêu đề. Bỏ qua."
+                            )
 
         if not dfs:
             return pd.DataFrame(columns=final_cols_order)
@@ -304,6 +315,9 @@ class DataProcessor:
         result_df["exchange"] = result_df["exchange"].astype(
             pd.CategoricalDtype(categories=["HoSE", "HNX", "UPCoM", "Unknown"])
         )
+
+        # Tối ưu hóa bộ nhớ: Chuyển symbol sang kiểu Categorical
+        result_df["symbol"] = result_df["symbol"].astype("category")
 
         # Sắp xếp và loại bỏ trùng lặp (Giữ lại bản ghi cuối cùng của ngày)
         result_df.sort_values(by=["symbol", "trading_date"], inplace=True, ignore_index=True)

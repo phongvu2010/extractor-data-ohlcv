@@ -10,25 +10,6 @@ from typing import Any, Dict, List, Optional, Set
 from config import Config
 
 
-def safe_float(value: Any, default: float = 0.0) -> float:
-    """Ép kiểu sang float an toàn, trả về giá trị mặc định nếu thất bại."""
-    if value is None or pd.isna(value):
-        return default
-    try:
-        return float(value)
-    except (ValueError, TypeError):
-        return default
-
-def safe_int(value: Any, default: int = 0) -> int:
-    """Ép kiểu sang int an toàn, trả về giá trị mặc định nếu thất bại."""
-    if value is None or pd.isna(value):
-        return default
-    try:
-        return int(float(value)) # Bọc thêm float đề phòng chuỗi dạng '100.0'
-    except (ValueError, TypeError):
-        return default
-
-
 class Storage:
     """Chuyên trách việc lưu trữ dữ liệu an toàn ra đĩa cứng (Parquet, JSON)."""
 
@@ -72,10 +53,14 @@ class Storage:
             os.makedirs(output_dir, exist_ok=True)
             target_file_path: str = os.path.join(output_dir, file_name)
 
-            if os.path.exists(target_file_path):
-                os.remove(target_file_path)
+            # Ghi đè nguyên tử (Atomic Replace) nếu cùng phân vùng đĩa, fallback shutil.move nếu khác phân vùng
+            try:
+                os.replace(staging_file_path, target_file_path)
+            except OSError:
+                if os.path.exists(target_file_path):
+                    os.remove(target_file_path)
+                shutil.move(staging_file_path, target_file_path)
 
-            shutil.move(staging_file_path, target_file_path) # Chỉ định rõ target file path thay vì chỉ chỉ định thư mục
             self.logger.info(f"🎉 File lưu trữ thành công tại: {target_file_path}")
         except Exception as e:
             self.logger.error(f"❌ Lỗi trong quá trình ghi file Parquet: {e}")
@@ -102,7 +87,11 @@ class Storage:
         # Tính toán giá trung bình nhanh chóng bằng toán tử cột
         price_cols: List[str] = ["open_price", "high_price", "low_price", "close_price"]
         if "average_price" not in df_latest.columns:
-            df_latest["average_price"] = df_latest[price_cols].mean(axis=1).round(2)
+            df_latest["average_price"] = df_latest[price_cols].mean(axis=1)
+
+        # Chuẩn hóa kiểu dữ liệu số thực về float64 và làm tròn để tránh lỗi hiển thị trên JSON
+        for col in price_cols + ["average_price"]:
+            df_latest[col] = df_latest[col].astype(float).round(1)
 
         # Chuẩn hóa cột ngày sang chuỗi YYYY-MM-DD
         df_latest["trading_date"] = df_latest["trading_date"].dt.strftime("%Y-%m-%d")
@@ -110,7 +99,9 @@ class Storage:
         # Lấy ngày chạy lớn nhất để lưu metadata
         max_date_str: str = str(df_latest["trading_date"].max())
 
-        # Thiết lập symbol làm index để pandas xuất cấu trúc dạng {symbol: {col: val}}
+        # Đảm bảo index symbol là chuỗi thông thường (không phải categorical) để xuất dict sạch sẽ
+        if isinstance(df_latest["symbol"].dtype, pd.CategoricalDtype):
+            df_latest["symbol"] = df_latest["symbol"].astype(str)
         df_latest.set_index("symbol", inplace=True)
 
         # Chỉ lấy các cột cần thiết, ép kiểu chuẩn về dict nguyên bản của Python để gom JSON
@@ -140,6 +131,12 @@ class Storage:
             # Nếu mã chưa có hoặc có ngày mới hơn/bằng ngày cũ -> Cập nhật thông tin mới nhất
             if not old_row or new_row["trading_date"] >= old_row["trading_date"]:
                 merged_snapshots[sym] = new_row
+
+        # Chuẩn hóa toàn bộ dữ liệu số thực trong merged_snapshots để dọn dẹp các tàn dư float32 cũ
+        for sym, row in merged_snapshots.items():
+            for col in price_cols + ["average_price"]:
+                if col in row and isinstance(row[col], (int, float)):
+                    row[col] = round(float(row[col]), 1)
 
         # 4. Áp dụng bộ lọc active_symbols & Sắp xếp Alphabet gọn gàng
         final_snapshots: Dict[str, Dict[str, Any]] = {}
