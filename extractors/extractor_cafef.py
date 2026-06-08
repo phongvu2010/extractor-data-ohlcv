@@ -89,46 +89,46 @@ class Downloader:
 
         try:
             # Sử dụng stream=True để trì hoãn việc tải xuống phần thân (body) của file
-            response: requests.Response = self.session.get(url, timeout=Config.NETWORK_TIMEOUT, stream=True)
-            response.raise_for_status()
+            with self.session.get(url, timeout=Config.NETWORK_TIMEOUT, stream=True) as response:
+                response.raise_for_status()
 
-            # 1. Phòng thủ vòng 1: Kiểm tra Content-Length (nếu có) hoặc loại nội dung
-            content_type = response.headers.get("Content-Type", "")
-            if "text/html" in content_type:
-                self.logger.error("❌ [CafeF] URL trả về trang HTML (có thể là trang lỗi ẩn của CDN), không phải file ZIP.")
-                return None
+                # 1. Phòng thủ vòng 1: Kiểm tra Content-Length (nếu có) hoặc loại nội dung
+                content_type = response.headers.get("Content-Type", "")
+                if "text/html" in content_type:
+                    self.logger.error("❌ [CafeF] URL trả về trang HTML (có thể là trang lỗi ẩn của CDN), không phải file ZIP.")
+                    return None
 
-            # 2. Phòng thủ vòng 2: Kiểm tra Magic Bytes (Ký hiệu nhận diện file ZIP)
-            # File ZIP chuẩn luôn bắt đầu bằng cụm 'PK\x03\x04' (Hex: 50 4B 03 04)
-            ZIP_MAGIC_START = b"PK\x03\x04"
+                # 2. Phòng thủ vòng 2: Kiểm tra Magic Bytes (Ký hiệu nhận diện file ZIP)
+                # File ZIP chuẩn luôn bắt đầu bằng cụm 'PK\x03\x04' (Hex: 50 4B 03 04)
+                ZIP_MAGIC_START = b"PK\x03\x04"
 
-            # Tạo iterator duy nhất từ response để đọc dữ liệu từ mạng
-            stream_iterator = response.iter_content(chunk_size=65536)
+                # Tạo iterator duy nhất từ response để đọc dữ liệu từ mạng
+                stream_iterator = response.iter_content(chunk_size=65536)
 
-            try:
-                first_chunk = next(stream_iterator)
-            except StopIteration:
-                first_chunk = b""
+                try:
+                    first_chunk = next(stream_iterator)
+                except StopIteration:
+                    first_chunk = b""
 
-            if not first_chunk.startswith(ZIP_MAGIC_START):
-                self.logger.error(
-                    f"❌ [CafeF] File tải về không phải định dạng ZIP hợp lệ. Magic bytes nhận được: {first_chunk[:4]}"
-                )
-                return None
+                if not first_chunk.startswith(ZIP_MAGIC_START):
+                    self.logger.error(
+                        f"❌ [CafeF] File tải về không phải định dạng ZIP hợp lệ. Magic bytes nhận được: {first_chunk[:4]}"
+                    )
+                    return None
 
-            # 3. Tiến hành tải phần còn lại khi đã xác nhận file an toàn
-            # Khởi tạo luồng BytesIO và nạp chunk đầu tiên đã đọc vào RAM
-            zip_stream = io.BytesIO()
-            zip_stream.write(first_chunk)
+                # 3. Tiến hành tải phần còn lại khi đã xác nhận file an toàn
+                # Khởi tạo luồng BytesIO và nạp chunk đầu tiên đã đọc vào RAM
+                zip_stream = io.BytesIO()
+                zip_stream.write(first_chunk)
 
-            # Đọc cuốn chiếu các phần còn lại theo từng block 64KB từ iterator hiện tại để ghi vào RAM, tránh phình bộ nhớ đột ngột
-            for chunk in stream_iterator:
-                if chunk:
-                    zip_stream.write(chunk)
+                # Đọc cuốn chiếu các phần còn lại theo từng block 64KB từ iterator hiện tại để ghi vào RAM, tránh phình bộ nhớ đột ngột
+                for chunk in stream_iterator:
+                    if chunk:
+                        zip_stream.write(chunk)
 
-            # Đưa con trỏ stream về lại vị trí xuất phát (0) để sẵn sàng cho thư viện zipfile đọc tiếp
-            zip_stream.seek(0)
-            return zip_stream
+                # Đưa con trỏ stream về lại vị trí xuất phát (0) để sẵn sàng cho thư viện zipfile đọc tiếp
+                zip_stream.seek(0)
+                return zip_stream
         except requests.exceptions.Timeout as e:
             self.logger.error(f"⏳ [CafeF] Yêu cầu bị Timeout sau {Config.NETWORK_TIMEOUT} giây: {e}")
         except requests.exceptions.HTTPError as e:

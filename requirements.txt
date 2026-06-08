@@ -18,7 +18,10 @@
 
 
 ### Package
+holidays
+google-cloud-storage
 pandas
 pyarrow
 requests
 rich
+vnstock
