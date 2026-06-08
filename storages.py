@@ -111,6 +111,49 @@ class Storage:
             self.logger.error(f"❌ ☁️ [GCS] Lỗi trong quá trình ghi file Parquet lên GCS: {e}")
             raise e
 
+    def save_symbol_history(
+        self,
+        df: pd.DataFrame,
+        symbol: str,
+        suffix: str = "adj"
+    ) -> None:
+        """Ghi toàn bộ lịch sử giá của một mã cổ phiếu cụ thể ra file Parquet riêng biệt trên GCS.
+
+        Args:
+            df: DataFrame dữ liệu lịch sử đầy đủ của mã cổ phiếu.
+            symbol: Mã cổ phiếu (ví dụ: FPT).
+            suffix: Tiền tố thư mục ('raw' hoặc 'adj').
+
+        Raises:
+            Exception: Phát sinh khi ghi dữ liệu lên GCS thất bại.
+        """
+        if df is None or df.empty:
+            return
+
+        gcs_path = f"{Config.GCS_PARQUET_PREFIX}/{suffix}/reloaded/{symbol.upper()}.parquet"
+
+        try:
+            self.logger.info(f"💾 ☁️ [GCS] Đang ghi dữ liệu lịch sử cho mã {symbol.upper()} tại: gs://{Config.GCS_BUCKET_NAME}/{gcs_path}")
+            
+            bio = io.BytesIO()
+            df.to_parquet(
+                bio,
+                compression="snappy",
+                index=False,
+                coerce_timestamps="us",
+                allow_truncated_timestamps=True
+            )
+            bio.seek(0)
+
+            # Khởi tạo blob và upload
+            blob = self.bucket.blob(gcs_path)
+            blob.upload_from_file(bio, content_type="application/octet-stream")
+
+            self.logger.info(f"🎉 ☁️ [GCS] File lịch sử mã {symbol.upper()} lưu trữ thành công tại GCS: gs://{Config.GCS_BUCKET_NAME}/{gcs_path}")
+        except Exception as e:
+            self.logger.error(f"❌ ☁️ [GCS] Lỗi khi ghi file lịch sử cho mã {symbol.upper()} lên GCS: {e}")
+            raise e
+
     def read_checkpoint(self) -> Dict[str, Dict[str, Any]]:
         """Đọc tệp snapshot cũ trực tiếp từ GCS. Trả về dict rỗng nếu không tồn tại."""
         blob = self.bucket.blob(Config.GCS_CHECKPOINT_KEY)
