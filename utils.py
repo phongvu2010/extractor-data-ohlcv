@@ -60,6 +60,12 @@ class SmartRateLimiter:
         self.last_request_time: float = 0.0
 
     def hit(self) -> None:
+        if self.is_threshold_reached():
+            self.logger.warning(
+                f"⚠️ Đạt giới hạn API ({self.limit} req/{self.window}s). Tiến hành làm mát..."
+            )
+            self.wait_if_needed()
+
         self.count += 1
         now = time.time()
         elapsed = now - self.last_request_time

@@ -37,12 +37,6 @@ class DataProcessor:
             micro_sleep=Config.API_MICRO_SLEEP,
         )
 
-    def get_symbols(self):
-        self.rate_limiter.hit()
-        df_symbols = self.reference_api.equity().list_by_exchange()
-        df_symbols = df_symbols[~df_symbols["type"].isin(["corpbond", "bond", "future"])]
-
-        return df_symbols["symbol"].tolist()
 
     def get_symbols_with_exchange(self) -> dict:
         self.rate_limiter.hit()
@@ -357,6 +351,9 @@ class VnstockExtractorETL:
             self.logger.warning("⚠️ Không lấy được dữ liệu T0. Dừng pipeline.")
             return None
 
+        # Lấy ngày lớn nhất trong df_t0 làm mốc chặn trên
+        t0_max_date = df_t0["trading_date"].dt.date.max()
+
         # 3. Lấy checkpoint để kiểm tra ngày chạy cuối cùng thành công
         latest_state = self.storage.read_checkpoint()
         metadata = latest_state.get("metadata") or {}
@@ -374,12 +371,18 @@ class VnstockExtractorETL:
             except Exception as e:
                 self.logger.warning(f"⚠️ Không thể phân tích ngày chạy cuối cùng {last_run_str}: {e}")
 
+        # --- CHỐT CHẶN: KIỂM TRA NGÀY GIAO DỊCH MỚI ---
+        if date_latest_state and t0_max_date <= date_latest_state:
+            self.logger.warning(
+                f"ℹ️ Ngày giao dịch lớn nhất của dữ liệu mới tải ({t0_max_date}) "
+                f"không lớn hơn ngày đã chạy thành công gần nhất ({date_latest_state}). "
+                "Hôm nay có thể là ngày nghỉ giao dịch (SSC Holiday). Dừng pipeline."
+            )
+            return None
+
         # 4. Tính toán các ngày giao dịch bị thiếu để chạy backfill
         missing_dates = []
         if date_latest_state:
-            # Lấy ngày lớn nhất trong df_t0 làm mốc chặn trên
-            t0_max_date = df_t0["trading_date"].dt.date.max()
-            
             # Quét qua các ngày tính từ ngày checkpoint chạy thành công. 
             # Nếu ngày checkpoint cũ đã chốt phiên EOD -> Bắt đầu quét từ ngày tiếp theo.
             # Nếu chưa chốt phiên EOD -> Bắt đầu quét từ chính ngày đó để chạy bù dữ liệu EOD chuẩn.
@@ -396,12 +399,13 @@ class VnstockExtractorETL:
 
         # 4.5. Phát hiện sự kiện chia cổ tức/sự kiện doanh nghiệp (Corporate Actions) trước khi chạy Backfill
         detected_corporate_actions = {} # Map symbol -> ex_date
+        suspected_tickers = []          # Danh sách các mã nghi ngờ bị lệch giá
         
-        # A. Quét sự kiện của ngày hôm nay (T0) bằng cách so sánh giá tham chiếu hôm nay với giá chốt phiên hôm qua
+        # A. Quét sự kiện của ngày hôm nay (T0) bằng phương pháp lọc lai (So sánh giá cục bộ trước, gọi API kiểm tra dự phòng sau)
         try:
-            today_str = df_t0["trading_date"].dt.strftime("%Y-%m-%d").max()
-            today_date = df_t0["trading_date"].dt.date.max()
-            self.logger.info(f"🔍 [Corporate Actions T0] Đang quét chênh lệch giá cho ngày {today_str}...")
+            today_date = t0_max_date
+            today_str = today_date.strftime("%Y-%m-%d")
+            self.logger.info(f"🔍 [Corporate Actions T0] Đang quét chênh lệch giá cục bộ cho ngày {today_str}...")
             
             # Đọc snapshot từ checkpoint cũ
             if latest_state and "snapshots" in latest_state:
@@ -423,26 +427,53 @@ class VnstockExtractorETL:
                     if exch in ["HoSE", "HNX"]:
                         prev_close = snap.get("close_price")
                         if prev_close and abs(ref_price - prev_close) > 10:
-                            self.logger.warning(
-                                f"🔔 [T0] Phát hiện biến động giá cho {sym} ({exch}): "
-                                f"Ref Price={ref_price:.0f}, Prev Close={prev_close:.0f}. "
-                                f"Chênh lệch={abs(ref_price - prev_close):.0f} VND."
-                            )
-                            detected_corporate_actions[sym] = today_date
+                            suspected_tickers.append(sym)
                     elif exch == "UPCoM":
                         prev_avg = snap.get("average_price")
-                        if prev_avg and abs(ref_price - prev_avg) > 100:
-                            self.logger.warning(
-                                f"🔔 [T0] Phát hiện biến động giá cho {sym} ({exch}): "
-                                f"Ref Price={ref_price:.0f}, Prev Avg={prev_avg:.1f}. "
-                                f"Chênh lệch={abs(ref_price - prev_avg):.1f} VND."
-                            )
-                            detected_corporate_actions[sym] = today_date
+                        # Nâng ngưỡng lên 300đ để tránh cảnh báo giả từ sai số trung bình cộng CafeF
+                        if prev_avg and abs(ref_price - prev_avg) > 300:
+                            suspected_tickers.append(sym)
+            
+                # Chỉ gọi API đối soát sự kiện khi phát hiện mã nghi ngờ để tối ưu hóa tần suất request (IP protection)
+                if suspected_tickers:
+                    self.logger.warning(
+                        f"🔔 Phát hiện {len(suspected_tickers)} mã nghi ngờ lệch giá: {suspected_tickers}. "
+                        f"Tiến hành gọi API dự phòng để xác thực sự kiện..."
+                    )
+                    
+                    # Gọi API vnstock kiểm tra sự kiện DIV/ISS của chỉ những mã nghi ngờ trong hôm nay
+                    today_formatted_str = today_date.strftime("%Y%m%d")
+                    
+                    from vnstock.api.company import Company
+                    import logging
+                    # Chặn logs chi tiết từ provider API để giao diện sạch sẽ
+                    logging.getLogger("vnstock.explorer.vci.company").setLevel(logging.CRITICAL)
+                    
+                    c = Company(symbol=",".join(suspected_tickers), source='VCI')
+                    self.processor.rate_limiter.hit()
+                    events = c._fetch_events(
+                        from_date=today_formatted_str,
+                        to_date=today_formatted_str,
+                        event_codes="DIV,ISS"
+                    )
+                    
+                    if events:
+                        for ev in events:
+                            ticker = str(ev.get("ticker")).strip().upper()
+                            if ticker in suspected_tickers:
+                                self.logger.warning(
+                                    f"✅ [Xác thực thành công] Mã {ticker} thực sự có sự kiện doanh nghiệp hôm nay."
+                                )
+                                detected_corporate_actions[ticker] = today_date
+                    else:
+                        self.logger.info("ℹ️ Không tìm thấy sự kiện khớp trên API. Lệch giá do sai số làm tròn hoặc giao dịch kỹ thuật.")
+                else:
+                    self.logger.info("ℹ️ Không phát hiện mã nào lệch giá bất thường hôm nay. Bỏ qua gọi API sự kiện.")
             else:
-                self.logger.info("ℹ️ Checkpoint cũ trống, bỏ qua quét sự kiện T0 qua so sánh giá.")
+                self.logger.info("ℹ️ Checkpoint cũ trống, bỏ qua quét sự kiện T0.")
         except Exception as e:
-            self.logger.error(f"⚠️ Lỗi khi quét sự kiện doanh nghiệp T0 qua so sánh giá: {e}", exc_info=True)
-
+            self.logger.error(f"⚠️ Lỗi khi quét sự kiện doanh nghiệp T0: {e}", exc_info=True)
+ 
         # B. Quét sự kiện của các ngày chạy backfill (nếu có) bằng API
         if missing_dates:
             try:
@@ -461,92 +492,34 @@ class VnstockExtractorETL:
                     detected_corporate_actions.update(detected_backfill_map)
             except Exception as e:
                 self.logger.error(f"⚠️ Lỗi khi quét sự kiện doanh nghiệp Backfill qua API: {e}", exc_info=True)
-
-        # 5. Tiến hành chạy backfill nếu phát hiện ngày bị thiếu
+ 
+        # 5. Tiến hành chạy backfill bằng nguồn CafeF nếu phát hiện ngày bị thiếu
         if missing_dates:
-            start_date_str = min(missing_dates).strftime("%Y-%m-%d")
-            end_date_str = max(missing_dates).strftime("%Y-%m-%d")
             self.logger.info(
-                f"🚀 Phát hiện {len(missing_dates)} ngày thiếu cần backfill: {missing_dates}. "
-                f"Bắt đầu kéo dữ liệu từ {start_date_str} đến {end_date_str}..."
+                f"🚀 Phát hiện {len(missing_dates)} ngày thiếu cần backfill. Tiến hành tải và xử lý qua CafeF..."
             )
+            from extractors.extractor_cafef import CafeFExtractorETL
+            cafe_etl = CafeFExtractorETL(logger_name=self.logger.name)
             
-            backfill_dfs = []
-            
-            # Tính toán limit động bên ngoài vòng lặp để tránh bị thiếu dòng nếu khoảng backfill lớn
-            num_days = (max(missing_dates) - min(missing_dates)).days + 5
-            backfill_limit_count = max(100, num_days)
-            
-            # Giới hạn số lượng mã kéo thử nếu cấu hình chế độ test (BACKFILL_LIMIT)
-            limit_symbols = symbols
-            if Config.BACKFILL_LIMIT > 0:
-                limit_symbols = symbols[:Config.BACKFILL_LIMIT]
-                self.logger.warning(f"⚠️ [Test Mode] Chỉ thực hiện backfill cho {Config.BACKFILL_LIMIT} mã đầu tiên.")
-            
-            for idx, symbol in enumerate(limit_symbols):
-                if idx > 0 and idx % 50 == 0:
-                    self.logger.info(f"⏳ Tiến trình backfill: {idx}/{len(limit_symbols)} mã...")
-                
-                df_ohclv = self.processor.fetch_ohlcv(symbol, start_date_str, end_date_str, limit=backfill_limit_count)
-                if df_ohclv is not None and not df_ohclv.empty:
-                    df_ohclv = df_ohclv.copy()
-                    
-                    # ⚠️ PHỤC HỒI GIÁ THÔ CHO DỮ LIỆU BACKFILL NẾU CÓ CỔ TỨC/CHIA TÁCH
-                    if symbol in detected_corporate_actions:
-                        ex_date = detected_corporate_actions[symbol]
-                        ratio = self.get_raw_to_adjusted_ratio(symbol, latest_state, ex_date)
-                        if ratio != 1.0:
-                            # Lọc các ngày trong df_ohclv nằm trước ngày không hưởng quyền (ex_date)
-                            mask = df_ohclv["trading_date"].dt.date < ex_date
-                            if mask.any():
-                                self.logger.warning(
-                                    f"✏️ [Backfill Raw Price Recovery] Đang phục hồi Giá thô cho {symbol} "
-                                    f"cho {mask.sum()} ngày trước ex_date {ex_date} bằng tỷ lệ {ratio:.6f}..."
-                                )
-                                price_cols = ["open_price", "high_price", "low_price", "close_price"]
-                                # Nhân tỷ lệ và làm tròn về số nguyên
-                                df_ohclv.loc[mask, price_cols] = (df_ohclv.loc[mask, price_cols] * ratio).round(0).astype("float32")
-                    
-                    # Lọc chỉ lấy các ngày thực sự bị thiếu
-                    df_ohclv = df_ohclv[df_ohclv["trading_date"].dt.date.isin(missing_dates)]
-                    if not df_ohclv.empty:
-                        df_ohclv["symbol"] = symbol
-                        df_ohclv["exchange"] = symbols_map[symbol]
-                        backfill_dfs.append(df_ohclv)
-            
-            if backfill_dfs:
-                df_backfill = pd.concat(backfill_dfs, ignore_index=True)
-                
-                # Đồng bộ dtypes và schema cho df_backfill giống CafeF
-                df_backfill["symbol"] = df_backfill["symbol"].astype(str).str.strip().str.upper().astype("category")
-                df_backfill["exchange"] = df_backfill["exchange"].apply(normalize_exchange).astype(
-                    pd.CategoricalDtype(categories=["HoSE", "HNX", "UPCoM", "Unknown"])
-                )
-                df_backfill["trading_date"] = pd.to_datetime(df_backfill["trading_date"]).dt.normalize()
-                
-                price_cols = ["open_price", "high_price", "low_price", "close_price"]
-                df_backfill[price_cols] = df_backfill[price_cols].astype("float32")
-                df_backfill["total_volume"] = df_backfill["total_volume"].astype("Int32")
-                
-                target_cols = ["symbol", "trading_date", "open_price", "high_price", "low_price", "close_price", "total_volume", "exchange"]
-                df_backfill = df_backfill[target_cols]
-                
-                # Phân nhóm theo trading_date và lưu từng file phân mảnh lên GCS theo thứ tự thời gian tăng dần
-                for date_group, group_df in sorted(df_backfill.groupby(df_backfill["trading_date"].dt.date), key=lambda x: x[0]):
-                    date_ref_group = datetime.combine(date_group, datetime.min.time())
-                    self.logger.info(f"💾 ☁️ [Backfill] Đang lưu phân mảnh GCS cho ngày {date_group}...")
-                    self.storage.save_parquet(group_df, date_ref_group, partition=True)
-            else:
-                self.logger.warning("⚠️ Không thể tải dữ liệu backfill cho bất kỳ mã nào.")
-
+            for m_date in sorted(missing_dates):
+                self.logger.info(f"📅 [Backfill CafeF] Đang tải dữ liệu thô cho ngày {m_date}...")
+                dt_ref = datetime.combine(m_date, datetime.min.time())
+                # Chạy pipeline CafeF thô ở chế độ lưu phân mảnh (partition=True)
+                # Note: cafe_etl.run tự động ghi parquet lên GCS và nạp lên BigQuery raw_price
+                cafe_etl.run(dt_ref, is_raw=True, partition=True)
+ 
         # 6. Ghi đè phân mảnh Parquet cho ngày hôm nay (T0) (chỉ lưu 8 cột CafeF)
         df_t0_parquet = df_t0.drop(columns=["reference_price", "average_price"], errors="ignore")
-        self.storage.save_parquet(df_t0_parquet, datetime.now(), partition=True)
+        gcs_path_t0 = self.storage.save_parquet(df_t0_parquet, datetime.combine(today_date, datetime.min.time()), partition=True)
+        
+        # Nạp trực tiếp dữ liệu thô ngày hôm nay (T0) từ GCS lên BigQuery
+        if gcs_path_t0:
+            self.storage.load_parquet_to_bigquery(gcs_path_t0, Config.BQ_RAW_TABLE, write_disposition="WRITE_APPEND")
 
         # 7. Lưu checkpoint snapshot EOD cho ngày hôm nay (T0)
         # Note: Chúng ta truyền df_t0 chứa cột average_price thực tế từ bảng giá để checkpoint lưu giá trung bình chuẩn
         self.storage.save_checkpoint(df_t0, set(symbols))
-
+ 
         # 8. Thực hiện reload toàn bộ lịch sử Giá điều chỉnh cho các mã phát hiện được
         if detected_corporate_actions:
             tickers_list = sorted(list(detected_corporate_actions.keys()))
@@ -586,6 +559,9 @@ class VnstockExtractorETL:
                         
                         # Lưu đè lịch sử giá điều chỉnh của mã này lên GCS
                         self.storage.save_symbol_history(df_hist_adj, ticker, suffix="adj")
+                        
+                        # Đồng bộ trực tiếp lên BigQuery
+                        self.storage.sync_adjusted_symbol_to_bigquery(ticker)
                     else:
                         self.logger.error(f"❌ Không thể tải lịch sử giá cho mã {ticker}")
                 except Exception as e:
@@ -593,4 +569,11 @@ class VnstockExtractorETL:
         else:
             self.logger.info("ℹ️ Không phát hiện mã cổ phiếu nào cần tải lại lịch sử Giá điều chỉnh.")
 
+        # 9. Đồng bộ hóa giá thô sang bảng adjusted_price cho tất cả các mã KHÔNG có sự kiện điều chỉnh giá
+        # (Lặp qua cả ngày hôm nay và các ngày chạy backfill nếu có)
+        all_processing_dates = sorted(missing_dates + [today_date])
+        for p_date in all_processing_dates:
+            excluded_for_date = [sym for sym, ex_date in detected_corporate_actions.items() if ex_date == p_date]
+            self.storage.sync_daily_adjusted_prices(p_date, excluded_for_date)
+ 
         return df_t0

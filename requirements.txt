@@ -19,6 +19,7 @@
 
 ### Package
 holidays
+google-cloud-bigquery
 google-cloud-storage
 pandas
 pyarrow

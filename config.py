@@ -22,17 +22,18 @@ class Config:
     GCS_CHECKPOINT_KEY: str = "checkpoints/latest_state.json"
     GCS_PARQUET_PREFIX: str = "market_data"
 
+    # Cấu hình Google Cloud BigQuery (BQ)
+    BQ_DATASET: str = "vn_stock_dataset"
+    BQ_RAW_TABLE: str = "raw_price"
+    BQ_ADJ_TABLE: str = "adjusted_price"
+
     # Các hằng số hệ thống cố định
     URL_CAFEF: str = "https://cafef1.mediacdn.vn/data/ami_data/"
     NETWORK_TIMEOUT: int = 30
     PRICE_MULTIPLIER: int = 1000
     CHUNK_SIZE: int = 150000
-    INPUT_BASE_DIR: str = "tmp"
     DEFAULT_LOGGER_NAME: str = "ETL_Pipeline"
     API_REQUEST_THRESHOLD: int = 18
     API_RATE_LIMIT_WINDOW: float = 60.0
     API_MICRO_SLEEP: float = 3.5
     BACKFILL_LIMIT: int = -1
-    HISTORICAL_DIR: str = "historical"
-    STAGING_DIR: str = "historical_staging_tmp"
-    CHECKPOINT_FILE: str = "latest_state.json"

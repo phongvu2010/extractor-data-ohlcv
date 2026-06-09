@@ -339,12 +339,18 @@ class CafeFExtractorETL:
         self.processor = DataProcessor(self.logger)
         self.storage = Storage(self.logger)
 
-    def run(self, date_ref: datetime, is_raw: bool = True) -> Optional[pd.DataFrame]:
+    def run(
+        self,
+        date_ref: datetime,
+        is_raw: bool = True,
+        partition: bool = False,
+    ) -> Optional[pd.DataFrame]:
         """Khởi chạy toàn bộ quy trình ETL tải, xử lý và lưu trữ dữ liệu lịch sử.
 
         Args:
             date_ref: Mốc ngày cần tải dữ liệu lịch sử của CafeF.
             is_raw: True để xử lý file giá thô (Raw), False để xử lý file giá điều chỉnh (Adj).
+            partition: True để lưu phân mảnh theo năm/tháng, False để lưu file gộp tĩnh.
 
         Returns:
             DataFrame kết quả cuối cùng nếu thành công, ngược lại trả về None.
@@ -370,7 +376,12 @@ class CafeFExtractorETL:
                     self.logger.info(f"✅ Tải và làm sạch dữ liệu thành công! Kích thước: {df.shape}")
 
                     # Bước 3: Ghi file dữ liệu nén Parquet chuyên dụng
-                    self.storage.save_parquet(df, date_ref, suffix)
+                    gcs_path = self.storage.save_parquet(df, date_ref, suffix, partition=partition)
+
+                    # Nạp trực tiếp dữ liệu từ GCS lên BigQuery
+                    if gcs_path:
+                        target_table = Config.BQ_RAW_TABLE if is_raw else Config.BQ_ADJ_TABLE
+                        self.storage.load_parquet_to_bigquery(gcs_path, target_table, write_disposition="WRITE_APPEND")
 
                     # Bước 4: Lưu dữ liệu trạng thái EOD Snapshot thị trường (Chỉ áp dụng với luồng giá Raw)
                     if is_raw:
