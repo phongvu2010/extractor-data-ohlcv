@@ -18,11 +18,13 @@
 
 
 ### Package
-holidays
-google-cloud-bigquery
-google-cloud-storage
-pandas
-pyarrow
-requests
-rich
-vnstock
+holidays==0.98
+google-cloud-bigquery==3.41.0
+google-cloud-storage==3.11.0
+pandas==2.3.3
+pyarrow==24.0.0
+requests==2.34.2
+rich==15.0.0
+vnstock==4.0.4
+python-dotenv==1.0.1
+

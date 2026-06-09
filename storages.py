@@ -40,21 +40,16 @@ class Storage:
         """
         self.logger: logging.Logger = logger
         try:
-            if os.path.exists(Config.GCS_CREDENTIALS_FILE):
-                self.client = storage.Client.from_service_account_json(Config.GCS_CREDENTIALS_FILE)
-                self.bq_client = bigquery.Client.from_service_account_json(Config.GCS_CREDENTIALS_FILE)
-            else:
-                self.logger.warning(
-                    f"⚠️ Không tìm thấy file credentials tại {Config.GCS_CREDENTIALS_FILE}. "
-                    "Sử dụng Default Credentials của hệ thống."
-                )
-                self.client = storage.Client()
-                self.bq_client = bigquery.Client()
+            # Khởi tạo GCS & BigQuery client sử dụng Application Default Credentials (ADC)
+            # Tự động nhận diện qua biến môi trường GOOGLE_APPLICATION_CREDENTIALS
+            self.client = storage.Client()
+            self.bq_client = bigquery.Client()
             self.bucket = self.client.bucket(Config.GCS_BUCKET_NAME)
-            self.logger.info(f"☁️ [GCS] Kết nối thành công đến bucket: {Config.GCS_BUCKET_NAME}")
-            self.logger.info(f"📊 [BigQuery] Kết nối thành công đến dự án: {self.bq_client.project}")
+            self.logger.info("☁️ [GCS] Kết nối thành công bằng Application Default Credentials (ADC).")
+            self.logger.info(f"☁️ [GCS] Bucket: {Config.GCS_BUCKET_NAME}")
+            self.logger.info(f"📊 [BigQuery] Dự án: {self.bq_client.project}")
         except Exception as e:
-            self.logger.error(f"🛑 [Storage] Lỗi khởi tạo kết nối Cloud Services: {e}")
+            self.logger.error(f"🛑 [Storage] Lỗi khởi tạo kết nối Cloud Services qua ADC: {e}")
             raise e
 
     def save_parquet(
@@ -177,43 +172,70 @@ class Storage:
             self.logger.error(f"❌ ☁️ [GCS] Lỗi khi ghi file lịch sử cho mã {symbol.upper()} lên GCS: {e}")
             raise e
 
+    def _ensure_table_exists(self, table_name: str) -> None:
+        """Đảm bảo Dataset và Table BigQuery tồn tại. Nếu chưa, tạo mới với phân vùng Month và Cluster."""
+        dataset_ref = self.bq_client.dataset(Config.BQ_DATASET)
+        try:
+            self.bq_client.get_dataset(dataset_ref)
+        except Exception:
+            self.logger.info(f"✨ [BigQuery] Đang khởi tạo dataset mới: {Config.BQ_DATASET}")
+            self.bq_client.create_dataset(bigquery.Dataset(dataset_ref))
+
+        table_ref = f"{self.bq_client.project}.{Config.BQ_DATASET}.{table_name}"
+        try:
+            self.bq_client.get_table(table_ref)
+        except Exception:
+            self.logger.info(f"✨ [BigQuery] Đang tạo bảng mới {table_name} với Monthly Partitioning & Clustering...")
+            schema = [
+                bigquery.SchemaField("symbol", "STRING"),
+                bigquery.SchemaField("trading_date", "DATE"),
+                bigquery.SchemaField("open_price", "FLOAT64"),
+                bigquery.SchemaField("high_price", "FLOAT64"),
+                bigquery.SchemaField("low_price", "FLOAT64"),
+                bigquery.SchemaField("close_price", "FLOAT64"),
+                bigquery.SchemaField("total_volume", "INTEGER"),
+                bigquery.SchemaField("exchange", "STRING"),
+            ]
+            table = bigquery.Table(table_ref, schema=schema)
+            table.time_partitioning = bigquery.TimePartitioning(
+                type_=bigquery.TimePartitioningType.MONTH,
+                field="trading_date"
+            )
+            table.clustering_fields = ["symbol", "exchange"]
+            self.bq_client.create_table(table)
+
     def sync_adjusted_symbol_to_bigquery(self, symbol: str) -> None:
-        """Thực hiện cập nhật dữ liệu lịch sử điều chỉnh của một mã lên BigQuery sử dụng Transaction."""
+        """Đồng bộ lịch sử điều chỉnh của một mã lên BigQuery (Xóa và Tải trực tiếp, tránh tạo bảng tạm DDL)."""
         gcs_uri = f"gs://{Config.GCS_BUCKET_NAME}/{Config.GCS_PARQUET_PREFIX}/adj/reloaded/{symbol.upper()}.parquet"
         self.logger.info(f"⚡ [BigQuery] Bắt đầu đồng bộ lịch sử điều chỉnh cho mã {symbol.upper()}...")
         
-        query = f"""
-        CREATE OR REPLACE TEMP TABLE stage_adj AS
-        SELECT * FROM FILES(
-          format = 'PARQUET',
-          uris = ['{gcs_uri}']
-        );
-
-        BEGIN TRANSACTION;
-        DELETE FROM `{self.bq_client.project}.{Config.BQ_DATASET}.{Config.BQ_ADJ_TABLE}` 
-        WHERE symbol = '{symbol.upper()}';
+        target_table_ref = f"{self.bq_client.project}.{Config.BQ_DATASET}.{Config.BQ_ADJ_TABLE}"
         
-        INSERT INTO `{self.bq_client.project}.{Config.BQ_DATASET}.{Config.BQ_ADJ_TABLE}`
-          (symbol, trading_date, open_price, high_price, low_price, close_price, total_volume, exchange)
-        SELECT 
-          CAST(symbol AS STRING), 
-          CAST(trading_date AS DATE), 
-          CAST(open_price AS FLOAT64), 
-          CAST(high_price AS FLOAT64), 
-          CAST(low_price AS FLOAT64), 
-          CAST(close_price AS FLOAT64), 
-          CAST(total_volume AS INT64), 
-          CAST(exchange AS STRING)
-        FROM stage_adj;
-        COMMIT TRANSACTION;
-        """
+        # Đảm bảo bảng đích tồn tại
+        self._ensure_table_exists(Config.BQ_ADJ_TABLE)
+        
+        # 1. Xóa dữ liệu cũ của mã cổ phiếu này
+        delete_query = f"DELETE FROM `{target_table_ref}` WHERE symbol = '{symbol.upper()}'"
+        try:
+            self.logger.info(f"🗑️ [BigQuery] Đang xóa lịch sử cũ của mã {symbol.upper()}...")
+            self.bq_client.query(delete_query).result()
+        except Exception as e:
+            self.logger.error(f"❌ [BigQuery] Lỗi khi xóa lịch sử mã {symbol.upper()}: {e}")
+            raise e
+            
+        # 2. Tải trực tiếp file Parquet từ GCS vào bảng chính
+        job_config = bigquery.LoadJobConfig(
+            source_format=bigquery.SourceFormat.PARQUET,
+            write_disposition="WRITE_APPEND",
+        )
         
         try:
-            query_job = self.bq_client.query(query)
-            query_job.result() # Đợi query hoàn thành
-            self.logger.info(f"🎉 [BigQuery] Đồng bộ hoàn tất cho mã {symbol.upper()}.")
+            self.logger.info(f"⚡ [BigQuery] Đang nạp dữ liệu điều chỉnh mới cho mã {symbol.upper()}...")
+            load_job = self.bq_client.load_table_from_uri(gcs_uri, target_table_ref, job_config=job_config)
+            load_job.result()
+            self.logger.info(f"🎉 [BigQuery] Đồng bộ hoàn tất cho mã {symbol.upper()}. Đã chèn {load_job.output_rows} dòng.")
         except Exception as e:
-            self.logger.error(f"❌ [BigQuery] Lỗi đồng bộ mã {symbol.upper()}: {e}")
+            self.logger.error(f"❌ [BigQuery] Lỗi khi nạp dữ liệu điều chỉnh cho mã {symbol.upper()}: {e}")
             raise e
 
     def load_parquet_to_bigquery(
@@ -222,17 +244,14 @@ class Storage:
         table_name: str,
         write_disposition: str = "WRITE_APPEND"
     ) -> None:
-        """Nạp trực tiếp dữ liệu từ tệp Parquet trên GCS vào bảng BigQuery.
-
-        Args:
-            gcs_path: Đường dẫn của tệp Parquet trên GCS.
-            table_name: Tên bảng đích trong BigQuery (raw_price hoặc adjusted_price).
-            write_disposition: Phương thức ghi ('WRITE_APPEND' hoặc 'WRITE_TRUNCATE').
-        """
+        """Nạp dữ liệu Parquet từ GCS vào BigQuery (tự động tạo bảng phân vùng & cụm nếu cần)."""
         gcs_uri = f"gs://{Config.GCS_BUCKET_NAME}/{gcs_path}"
         table_ref = f"{self.bq_client.project}.{Config.BQ_DATASET}.{table_name}"
         
         self.logger.info(f"⚡ [BigQuery] Đang nạp dữ liệu từ {gcs_uri} vào {table_ref} ({write_disposition})...")
+        
+        # Đảm bảo bảng đích tồn tại trước khi nạp
+        self._ensure_table_exists(table_name)
         
         job_config = bigquery.LoadJobConfig(
             source_format=bigquery.SourceFormat.PARQUET,
@@ -250,6 +269,7 @@ class Storage:
         except Exception as e:
             self.logger.error(f"❌ [BigQuery] Lỗi khi nạp dữ liệu từ {gcs_path} vào {table_name}: {e}")
             raise e
+
 
     def sync_daily_adjusted_prices(
         self,
@@ -311,6 +331,28 @@ class Storage:
             self.logger.error(f"❌ [BigQuery] Lỗi đồng bộ adjusted_price ngày {date_str}: {e}")
             raise e
 
+    def delete_by_date(self, table_name: str, date_ref: Any) -> None:
+        """Xóa toàn bộ bản ghi của một ngày cụ thể trong bảng BigQuery trước khi nạp lại.
+        
+        Giúp pipeline chạy lại nhiều lần (idempotent) mà không bị trùng lặp dữ liệu.
+        """
+        if hasattr(date_ref, "strftime"):
+            date_str = date_ref.strftime("%Y-%m-%d")
+        else:
+            date_str = str(date_ref)
+            
+        table_ref = f"`{self.bq_client.project}.{Config.BQ_DATASET}.{table_name}`"
+        self.logger.info(f"🗑️ [BigQuery] Đang xóa dữ liệu cũ ngày {date_str} từ bảng {table_ref}...")
+        
+        query = f"DELETE FROM {table_ref} WHERE trading_date = '{date_str}'"
+        try:
+            query_job = self.bq_client.query(query)
+            query_job.result()
+            self.logger.info(f"🎉 [BigQuery] Đã dọn dẹp xong dữ liệu ngày {date_str}.")
+        except Exception as e:
+            self.logger.error(f"❌ [BigQuery] Lỗi khi dọn dẹp dữ liệu ngày {date_str}: {e}")
+            raise e
+
     def read_checkpoint(self) -> Dict[str, Dict[str, Any]]:
         """Đọc tệp snapshot cũ trực tiếp từ GCS. Trả về dict rỗng nếu không tồn tại."""
         blob = self.bucket.blob(Config.GCS_CHECKPOINT_KEY)
@@ -323,12 +365,18 @@ class Storage:
                 return {}
         return {}
 
-    def save_checkpoint(self, df: pd.DataFrame, active_symbols: Optional[Set[str]] = None) -> None:
+    def save_checkpoint(
+        self,
+        df: pd.DataFrame,
+        active_symbols: Optional[Set[str]] = None,
+        pending_adjusted_reloads: Optional[List[str]] = None
+    ) -> None:
         """Trích xuất và cập nhật trạng thái thị trường EOD (Snapshot) trực tiếp lên GCS.
 
         Args:
             df: DataFrame dữ liệu tổng hợp của ngày chạy hiện tại.
             active_symbols: Danh sách các mã cổ phiếu đang niêm yết thực tế trên thị trường (Tùy chọn).
+            pending_adjusted_reloads: Danh sách các mã cổ phiếu lỗi cần chạy lại lịch sử điều chỉnh (Tùy chọn).
         """
         if df is None or df.empty:
             return
@@ -373,16 +421,26 @@ class Storage:
         current_data_dict: Dict[str, Dict[str, Any]] = df_latest[cols_to_extract].to_dict(orient="index")
 
         # 2. Đọc dữ liệu lịch sử cũ từ file checkpoint trên GCS
-        merged_snapshots: Dict[str, Dict[str, Any]] = self.read_checkpoint().get("snapshots", {})
+        old_checkpoint = self.read_checkpoint()
+        merged_snapshots: Dict[str, Dict[str, Any]] = old_checkpoint.get("snapshots", {})
+        old_metadata = old_checkpoint.get("metadata") or {}
+        old_pending = old_metadata.get("pending_adjusted_reloads") or []
 
-        # 3. Tiến hành Hợp nhất (Upsert) O(1)
-        for sym, new_row in current_data_dict.items():
-            if not sym: 
-                continue
-            old_row = merged_snapshots.get(sym)
-            # Nếu mã chưa có hoặc có ngày mới hơn/bằng ngày cũ -> Cập nhật thông tin mới nhất
-            if not old_row or new_row["trading_date"] >= old_row["trading_date"]:
-                merged_snapshots[sym] = new_row
+        # Hợp nhất pending_adjusted_reloads cũ nếu không được truyền vào mới (như từ CafeF run)
+        if pending_adjusted_reloads is None:
+            pending_adjusted_reloads = old_pending
+
+        # 3. Tiến hành Hợp nhất (Upsert) O(1) - Chỉ cập nhật snapshots khi đã chốt phiên EOD thực tế
+        if is_eod:
+            for sym, new_row in current_data_dict.items():
+                if not sym: 
+                    continue
+                old_row = merged_snapshots.get(sym)
+                # Nếu mã chưa có hoặc có ngày mới hơn/bằng ngày cũ -> Cập nhật thông tin mới nhất
+                if not old_row or new_row["trading_date"] >= old_row["trading_date"]:
+                    merged_snapshots[sym] = new_row
+        else:
+            self.logger.info("ℹ️ [Snapshot] Đang chạy trong phiên (Chưa chốt EOD). Giữ nguyên dữ liệu snapshots lịch sử từ phiên EOD trước.")
 
         # Chuẩn hóa toàn bộ dữ liệu trong merged_snapshots để dọn dẹp các tàn dư float32 cũ
         for sym, row in merged_snapshots.items():
@@ -404,7 +462,8 @@ class Storage:
             "metadata": {
                 "last_successful_run": max_date_str,
                 "is_eod": is_eod,
-                "total_tickers": len(final_snapshots)
+                "total_tickers": len(final_snapshots),
+                "pending_adjusted_reloads": pending_adjusted_reloads
             },
             "snapshots": final_snapshots
         }

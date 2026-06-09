@@ -1,7 +1,7 @@
 __pycache__/
+.git/
 .venv/
-tmp/
 
 .DS_Store
 .env
-**/credentials.json
+credentials.json

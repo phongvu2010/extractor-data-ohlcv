@@ -344,6 +344,7 @@ class CafeFExtractorETL:
         date_ref: datetime,
         is_raw: bool = True,
         partition: bool = False,
+        save_checkpoint: bool = True,
     ) -> Optional[pd.DataFrame]:
         """Khởi chạy toàn bộ quy trình ETL tải, xử lý và lưu trữ dữ liệu lịch sử.
 
@@ -369,6 +370,10 @@ class CafeFExtractorETL:
                     # Bước 2: Phân tích, làm sạch dữ liệu
                     df: pd.DataFrame = self.processor.process_zip_content(zip_stream)
 
+                    if partition:
+                        # Lọc dữ liệu chỉ lấy ngày cần chạy (tránh nạp toàn bộ lịch sử gây lỗi quá số lượng partition BQ)
+                        df = df[pd.to_datetime(df["trading_date"]).dt.date == date_ref.date()].copy()
+
                     if df.empty:
                         self.logger.error("🛑 Pipeline kết thúc sớm do tập dữ liệu sau khi làm sạch trống rỗng.")
                         return None
@@ -381,10 +386,17 @@ class CafeFExtractorETL:
                     # Nạp trực tiếp dữ liệu từ GCS lên BigQuery
                     if gcs_path:
                         target_table = Config.BQ_RAW_TABLE if is_raw else Config.BQ_ADJ_TABLE
-                        self.storage.load_parquet_to_bigquery(gcs_path, target_table, write_disposition="WRITE_APPEND")
+                        if partition:
+                            # Chế độ chạy hàng ngày / backfill phân mảnh: Xoá ngày cũ và append ngày mới
+                            self.storage.delete_by_date(target_table, date_ref)
+                            self.storage.load_parquet_to_bigquery(gcs_path, target_table, write_disposition="WRITE_APPEND")
+                        else:
+                            # Chế độ khởi tạo dữ liệu lịch sử tĩnh: Ghi đè toàn bộ bảng để tránh nhân bản dữ liệu
+                            self.logger.warning(f"⚠️ Đang nạp toàn bộ lịch sử ở chế độ WRITE_TRUNCATE cho bảng {target_table}...")
+                            self.storage.load_parquet_to_bigquery(gcs_path, target_table, write_disposition="WRITE_TRUNCATE")
 
                     # Bước 4: Lưu dữ liệu trạng thái EOD Snapshot thị trường (Chỉ áp dụng với luồng giá Raw)
-                    if is_raw:
+                    if is_raw and save_checkpoint:
                         # Truyền thêm tham số check xem có phải chạy nạp lịch sử (Init) hay không
                         # Nếu date_ref quá cũ so với hiện tại, hệ thống tự động nhận biết để lưu snapshot thông minh hơn
                         self.storage.save_checkpoint(df)
