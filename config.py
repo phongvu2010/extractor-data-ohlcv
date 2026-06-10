@@ -1,16 +1,25 @@
 import os
+from datetime import datetime
+from typing import List, Union
+from dotenv import load_dotenv
 import holidays
 import pytz
-from datetime import datetime
-from typing import List
-from dotenv import load_dotenv
 
-# Load variables from .env file (if present)
+# Tải trước các biến môi trường từ tệp .env nhằm phục vụ cấu hình động
 load_dotenv()
 
 
 def _get_env_int(key: str, default: int) -> int:
-    val = os.getenv(key)
+    """Lấy giá trị cấu hình số nguyên từ biến môi trường.
+
+    Args:
+        key: Tên biến môi trường cần lấy.
+        default: Giá trị mặc định nếu biến môi trường không tồn tại hoặc lỗi định dạng.
+
+    Returns:
+        Giá trị số nguyên tương ứng.
+    """
+    val: Union[str, None] = os.getenv(key)
     if val is None:
         return default
     try:
@@ -20,7 +29,16 @@ def _get_env_int(key: str, default: int) -> int:
 
 
 def _get_env_float(key: str, default: float) -> float:
-    val = os.getenv(key)
+    """Lấy giá trị cấu hình số thực từ biến môi trường.
+
+    Args:
+        key: Tên biến môi trường cần lấy.
+        default: Giá trị mặc định nếu biến môi trường không tồn tại hoặc lỗi định dạng.
+
+    Returns:
+        Giá trị số thực tương ứng.
+    """
+    val: Union[str, None] = os.getenv(key)
     if val is None:
         return default
     try:
@@ -34,10 +52,20 @@ class Config:
 
     # Thiết lập múi giờ Việt Nam để đồng bộ thời gian giao dịch sàn nội địa
     VN_TZ: pytz.tzinfo.BaseTzInfo = pytz.timezone("Asia/Ho_Chi_Minh")
-    # Lịch nghỉ lễ Việt Nam
+
+    # Xác định lịch nghỉ lễ Việt Nam xung quanh năm hiện hành để lọc ngày đóng cửa thị trường
     CURRENT_YEAR: int = datetime.now(VN_TZ).year
-    VN_HOLIDAYS_OBJ: holidays.VN = holidays.VN(years=[CURRENT_YEAR - 1, CURRENT_YEAR, CURRENT_YEAR + 1])
-    VN_HOLIDAY_DATES: List = [str(date) for date in VN_HOLIDAYS_OBJ.keys()]
+    VN_HOLIDAYS_OBJ: holidays.HolidayBase = holidays.country_holidays("VN", years=[CURRENT_YEAR - 1, CURRENT_YEAR, CURRENT_YEAR + 1])
+    
+    # Danh sách ngày nghỉ lễ bổ sung được cấu hình thủ công qua biến môi trường (dạng YYYY-MM-DD, cách nhau bởi dấu phẩy)
+    _custom_holidays_raw: str = os.getenv("CUSTOM_HOLIDAYS", "")
+    _custom_holiday_list: List[str] = [
+        d.strip() for d in _custom_holidays_raw.split(",") if d.strip()
+    ]
+    
+    VN_HOLIDAY_DATES: List[str] = sorted(list(
+        set([str(date) for date in VN_HOLIDAYS_OBJ.keys()] + _custom_holiday_list)
+    ))
 
     # Cấu hình Google Cloud Storage (GCS)
     GCS_BUCKET_NAME: str = os.getenv("GCS_BUCKET_NAME", "vn-stock")
@@ -60,12 +88,13 @@ class Config:
     API_MICRO_SLEEP: float = _get_env_float("API_MICRO_SLEEP", 3.5)
     BACKFILL_LIMIT: int = _get_env_int("BACKFILL_LIMIT", -1)
 
+    # Ngưỡng lệch giá để phát hiện sự kiện doanh nghiệp (dạng phần trăm, ví dụ: 0.005 = 0.5%, 0.01 = 1%)
+    PRICE_DEV_THRESHOLD_HOSE_HNX: float = _get_env_float("PRICE_DEV_THRESHOLD_HOSE_HNX", 0.005)
+    PRICE_DEV_THRESHOLD_UPCOM: float = _get_env_float("PRICE_DEV_THRESHOLD_UPCOM", 0.01)
+
     # Cảnh báo qua Telegram
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
-    # Cấu hình bỏ qua chốt chặn cuối tuần
+    # Cấu hình bỏ qua chốt chặn cuối tuần khi cần backfill thủ công vào thứ 7/chủ nhật
     FORCE_RUN_WEEKEND: bool = os.getenv("FORCE_RUN_WEEKEND", "false").lower() == "true"
-
-
-
