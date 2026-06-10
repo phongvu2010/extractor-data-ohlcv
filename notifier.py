@@ -90,6 +90,7 @@ class Notifier:
         missing_dates: List[Any],
         reloaded_symbols: List[str],
         failed_reloads: List[str],
+        export_summary: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Gửi báo cáo tổng hợp chi tiết sau khi kết thúc phiên chạy hàng ngày thành công.
 
@@ -100,6 +101,7 @@ class Notifier:
             missing_dates: Danh sách các ngày giao dịch còn thiếu đã chạy backfill.
             reloaded_symbols: Danh sách các mã cổ phiếu được tải lại giá điều chỉnh thành công.
             failed_reloads: Danh sách các mã gặp sự cố khi tải lại lịch sử giá điều chỉnh.
+            export_summary: Thông số tóm tắt tiến trình xuất dữ liệu các mã quan tâm lên GCS.
         """
         def _format_symbols(symbols: List[str], max_show: int = 15) -> str:
             if not symbols:
@@ -128,6 +130,14 @@ class Notifier:
             formatted_msg += f"❌ <b>Mã lỗi reload:</b> <code>{failed_str}</code>\n"
         else:
             formatted_msg += "✨ <b>Kết quả:</b> Hoàn thành xuất sắc, không có lỗi.\n"
+
+        if export_summary:
+            formatted_msg += (
+                f"\n📤 <b>Trích xuất GCS (Parquet):</b>\n"
+                f"📋 <b>Mã quan tâm:</b> {export_summary['tickers_count']} mã ({export_summary['exported_count']} thành công)\n"
+                f"📄 <b>Dòng Giá Thô:</b> {export_summary['raw_rows']:,} dòng\n"
+                f"📄 <b>Dòng Giá Điều chỉnh:</b> {export_summary['adj_rows']:,} dòng\n"
+            )
 
         formatted_msg += f"\n⏰ <i>Thời gian chạy: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</i>"
 

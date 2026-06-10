@@ -71,6 +71,9 @@ class Config:
     GCS_BUCKET_NAME: str = os.getenv("GCS_BUCKET_NAME", "vn-stock")
     GCS_CHECKPOINT_KEY: str = os.getenv("GCS_CHECKPOINT_KEY", "checkpoints/latest_state.json")
     GCS_PARQUET_PREFIX: str = os.getenv("GCS_PARQUET_PREFIX", "market_data")
+    GCS_EXPORT_TICKERS_KEY: str = os.getenv("GCS_EXPORT_TICKERS_KEY", "config/interested_tickers.txt")
+    GCS_EXPORT_PREFIX: str = os.getenv("GCS_EXPORT_PREFIX", "exports")
+    GCS_EXPORT_YEARS: int = _get_env_int("GCS_EXPORT_YEARS", 3)
 
     # Cấu hình Google Cloud BigQuery (BQ)
     BQ_DATASET: str = os.getenv("BQ_DATASET", "vn_stock_dataset")

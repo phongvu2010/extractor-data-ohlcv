@@ -2,7 +2,7 @@ import gc
 import io
 import json
 import logging
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Any, Dict, List, Optional, Set, Union
 import numpy as np
 import pandas as pd
@@ -560,3 +560,123 @@ class Storage:
             # Giải phóng các cấu trúc dữ liệu lớn thủ công để tối ưu RAM
             del current_data_dict, merged_snapshots, final_snapshots
             gc.collect()
+
+    def export_interested_tickers_data(self) -> Optional[Dict[str, Any]]:
+        """Trích xuất dữ liệu giá thô và giá điều chỉnh theo số năm cấu hình cho các mã cổ phiếu quan tâm.
+        
+        Danh sách các mã cổ phiếu được lấy từ file text (.txt) lưu trên GCS.
+        Dữ liệu trích xuất sẽ được lưu lại dưới dạng Parquet riêng biệt cho từng mã trên GCS.
+        """
+        # 1. Đọc tệp cấu hình danh sách mã quan tâm từ GCS
+        tickers_key = Config.GCS_EXPORT_TICKERS_KEY
+        blob = self.bucket.blob(tickers_key)
+        
+        if not blob.exists():
+            self.logger.info(f"ℹ️ Không tìm thấy file danh sách mã cổ phiếu quan tâm tại gs://{Config.GCS_BUCKET_NAME}/{tickers_key}. Bỏ qua trích xuất.")
+            return None
+            
+        content = blob.download_as_text(encoding="utf-8")
+        tickers = []
+        for line in content.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            # Cho phép các định dạng phân cách bằng khoảng trắng hoặc dấu phẩy
+            parts = [p.strip().upper() for p in line.replace(",", " ").split() if p.strip()]
+            tickers.extend(parts)
+            
+        tickers = sorted(list(set(tickers)))
+        if not tickers:
+            self.logger.info(f"ℹ️ File danh sách mã cổ phiếu quan tâm tại gs://{Config.GCS_BUCKET_NAME}/{tickers_key} trống. Bỏ qua trích xuất.")
+            return None
+            
+        self.logger.info(f"🚀 Bắt đầu trích xuất dữ liệu cho {len(tickers)} mã quan tâm: {tickers}")
+        
+        # 2. Tính toán khoảng thời gian (trọn vẹn các năm trước + năm hiện tại)
+        current_year = datetime.now(Config.VN_TZ).year
+        start_year = current_year - Config.GCS_EXPORT_YEARS
+        start_date = date(start_year, 1, 1)
+        self.logger.info(f"📅 Khoảng thời gian trích xuất: Từ {start_date} đến nay (Cấu hình {Config.GCS_EXPORT_YEARS} năm).")
+        
+        # 3. Chuẩn bị truy vấn SQL truy xuất dữ liệu từ BigQuery
+        query_raw = f"""
+            SELECT symbol, trading_date, open_price, high_price, low_price, close_price, total_volume, exchange
+            FROM `{self.bq_client.project}.{Config.BQ_DATASET}.{Config.BQ_RAW_TABLE}`
+            WHERE symbol IN UNNEST(@tickers)
+              AND trading_date >= @start_date
+            ORDER BY symbol ASC, trading_date ASC
+        """
+        
+        query_adj = f"""
+            SELECT symbol, trading_date, open_price, high_price, low_price, close_price, total_volume, exchange
+            FROM `{self.bq_client.project}.{Config.BQ_DATASET}.{Config.BQ_ADJ_TABLE}`
+            WHERE symbol IN UNNEST(@tickers)
+              AND trading_date >= @start_date
+            ORDER BY symbol ASC, trading_date ASC
+        """
+        
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ArrayQueryParameter("tickers", "STRING", tickers),
+                bigquery.ScalarQueryParameter("start_date", "DATE", start_date),
+            ]
+        )
+        
+        try:
+            self.logger.info(f"📥 Đang tải dữ liệu Giá Thô từ BigQuery...")
+            df_raw = self.bq_client.query(query_raw, job_config=job_config).to_dataframe()
+            
+            self.logger.info(f"📥 Đang tải dữ liệu Giá Điều Chỉnh từ BigQuery...")
+            df_adj = self.bq_client.query(query_adj, job_config=job_config).to_dataframe()
+            
+            # 4. Phân chia dữ liệu của từng mã và ghi lên GCS dưới dạng Parquet
+            export_prefix = Config.GCS_EXPORT_PREFIX
+            raw_count = 0
+            adj_count = 0
+            exported_tickers = set()
+
+            # Hàm phụ upload Parquet lên GCS
+            def upload_ticker_parquet(df_ticker: pd.DataFrame, ticker: str, category: str) -> str:
+                gcs_path = f"{export_prefix}/{category}/{ticker.upper()}.parquet"
+                bio = io.BytesIO()
+                df_write = df_ticker.copy()
+                if "trading_date" in df_write.columns:
+                    df_write["trading_date"] = pd.to_datetime(df_write["trading_date"]).dt.date
+                for col in ["symbol", "exchange"]:
+                    if col in df_write.columns:
+                        df_write[col] = df_write[col].astype(str)
+                df_write.to_parquet(bio, compression="snappy", index=False)
+                bio.seek(0)
+                blob_out = self.bucket.blob(gcs_path)
+                blob_out.upload_from_file(bio, content_type="application/octet-stream")
+                return gcs_path
+
+            # Duyệt qua từng mã để xuất dữ liệu
+            for ticker in tickers:
+                # Trích xuất dữ liệu giá thô của ticker
+                df_ticker_raw = df_raw[df_raw["symbol"] == ticker] if not df_raw.empty else pd.DataFrame()
+                if not df_ticker_raw.empty:
+                    upload_ticker_parquet(df_ticker_raw, ticker, "raw")
+                    raw_count += df_ticker_raw.shape[0]
+                    exported_tickers.add(ticker)
+                
+                # Trích xuất dữ liệu giá điều chỉnh của ticker
+                df_ticker_adj = df_adj[df_adj["symbol"] == ticker] if not df_adj.empty else pd.DataFrame()
+                if not df_ticker_adj.empty:
+                    upload_ticker_parquet(df_ticker_adj, ticker, "adj")
+                    adj_count += df_ticker_adj.shape[0]
+                    exported_tickers.add(ticker)
+
+            self.logger.info(f"✅ Hoàn tất xuất dữ liệu lên GCS cho các mã quan tâm.")
+            self.logger.info(f"📊 Chi tiết: {len(exported_tickers)} mã được xuất, Tổng số dòng raw: {raw_count}, adj: {adj_count}")
+            
+            return {
+                "tickers_count": len(tickers),
+                "exported_count": len(exported_tickers),
+                "raw_rows": raw_count,
+                "adj_rows": adj_count,
+            }
+            
+        except Exception as e:
+            self.logger.error(f"❌ Lỗi trong quá trình truy vấn hoặc ghi dữ liệu xuất lên GCS: {e}", exc_info=True)
+            raise e
