@@ -382,85 +382,22 @@ class VnstockExtractorETL:
     def _detect_corporate_actions_today(
         self,
         df_t0: pd.DataFrame,
-        latest_state: Dict[str, Any],
         today_date: date
     ) -> Dict[str, date]:
-        """Phát hiện các sự kiện doanh nghiệp của phiên T0 dựa vào biến động giá tham chiếu so với checkpoint.
+        """Phát hiện các sự kiện doanh nghiệp của phiên T0 thông qua việc quét trực tiếp API Lịch sự kiện doanh nghiệp.
 
         Args:
-            df_t0: DataFrame dữ liệu T0.
-            latest_state: Trạng thái checkpoint cũ đọc từ GCS.
+            df_t0: DataFrame dữ liệu T0 để lấy danh sách các mã giao dịch cần quét.
             today_date: Ngày giao dịch hôm nay.
 
         Returns:
             Dict chứa các mã cổ phiếu và ngày có sự kiện tương ứng.
         """
-        detected_corporate_actions: Dict[str, date] = {}
-        suspected_tickers: List[str] = []
-
-        if not latest_state or "snapshots" not in latest_state:
-            self.logger.info("ℹ️ Checkpoint cũ trống, bỏ qua quét sự kiện T0.")
-            return {}
-
-        old_snapshots: Dict[str, Dict[str, Any]] = latest_state["snapshots"]
-
-        # 1. Phát hiện sơ bộ các mã bị lệch giá tham chiếu so với giá chốt phiên hôm trước
-        for _, row in df_t0.iterrows():
-            sym: str = str(row["symbol"]).strip().upper()
-            if not sym or sym not in old_snapshots:
-                continue
-
-            snap: Dict[str, Any] = old_snapshots[sym]
-            exch: Optional[str] = snap.get("exchange")
-            ref_price: Optional[float] = row.get("reference_price")
-
-            if ref_price is None or pd.isna(ref_price) or ref_price <= 0:
-                continue
-
-            # Sàn HoSE/HNX: So sánh tỉ lệ phần trăm lệch giá tham chiếu T0 so với giá đóng cửa phiên trước
-            if exch in ["HoSE", "HNX"]:
-                prev_close: Optional[float] = snap.get("close_price")
-                if prev_close and prev_close > 0:
-                    deviation: float = abs(ref_price - prev_close) / prev_close
-                    if deviation > Config.PRICE_DEV_THRESHOLD_HOSE_HNX:
-                        suspected_tickers.append(sym)
-            # Sàn UPCoM: So sánh tỉ lệ phần trăm lệch giá tham chiếu T0 so với giá trung bình phiên trước
-            elif exch == "UPCoM":
-                prev_avg: Optional[float] = snap.get("average_price")
-                if prev_avg and prev_avg > 0:
-                    deviation: float = abs(ref_price - prev_avg) / prev_avg
-                    if deviation > Config.PRICE_DEV_THRESHOLD_UPCOM:
-                        suspected_tickers.append(sym)
-
-        # 2. Xác thực chính xác các mã lệch giá bằng cách gọi API lịch sự kiện doanh nghiệp
-        if suspected_tickers:
-            self.logger.warning(
-                f"🔔 Phát hiện {len(suspected_tickers)} mã nghi ngờ lệch giá: {suspected_tickers}. Tiến hành gọi API xác minh..."
-            )
-            today_formatted_str: str = today_date.strftime("%Y%m%d")
-            c: Company = Company(symbol='', source='VCI')
-            c.provider.symbol = ",".join(suspected_tickers)
-
-            self.processor.rate_limiter.hit()
-            events: Optional[List[Dict[str, Any]]] = c._fetch_events(
-                from_date=today_formatted_str,
-                to_date=today_formatted_str,
-                event_codes="DIV,ISS",
-                size=1000
-            )
-
-            if events:
-                for ev in events:
-                    ticker: str = str(ev.get("ticker")).strip().upper()
-                    if ticker in suspected_tickers:
-                        self.logger.warning(f"✅ [Xác thực thành công] Mã {ticker} thực sự có sự kiện doanh nghiệp hôm nay.")
-                        detected_corporate_actions[ticker] = today_date
-            else:
-                self.logger.info("ℹ️ Không tìm thấy sự kiện khớp trên API. Sự lệch giá do sai số làm tròn hoặc dữ liệu lag.")
-        else:
-            self.logger.info("ℹ️ Không phát hiện mã nào lệch giá bất thường hôm nay.")
-
-        return detected_corporate_actions
+        symbols: List[str] = [str(s) for s in df_t0["symbol"].unique() if s]
+        self.logger.info(
+            f"🔍 [Corporate Actions T0] Đang quét trực tiếp API sự kiện hôm nay cho {len(symbols)} mã..."
+        )
+        return self.processor.detect_corporate_actions_via_api(symbols, today_date, today_date)
 
     def _backfill_missing_history(self, missing_dates: List[date]) -> None:
         """Bù lại toàn bộ các ngày giao dịch bị thiếu thông qua extractor CafeF.
@@ -596,7 +533,7 @@ class VnstockExtractorETL:
 
         # 2. Phát hiện các sự kiện chia cổ tức/phát hành thêm cổ phiếu trong phiên T0
         detected_corporate_actions: Dict[str, date] = self._detect_corporate_actions_today(
-            df_t0, latest_state, today_date
+            df_t0, today_date
         )
 
         # 3. Phát hiện sự kiện doanh nghiệp của các ngày còn thiếu (Backfill) thông qua quét API
