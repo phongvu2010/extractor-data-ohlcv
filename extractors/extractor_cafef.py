@@ -15,6 +15,7 @@ from urllib3.util import Retry
 from config import Config
 from storages import Storage
 from utils import normalize_exchange, setup_logger
+from notifier import Notifier
 
 
 class Downloader:
@@ -344,6 +345,14 @@ class CafeFExtractorETL:
             with contextlib.closing(downloader.download_zip_stream(date_ref, is_raw=is_raw)) as zip_stream:
                 if not zip_stream or zip_stream.getvalue() == b"":
                     self.logger.error("🛑 Pipeline kết thúc sớm do không tải được tệp tin zip từ máy chủ.")
+                    if save_checkpoint:
+                        try:
+                            Notifier(self.logger).send_alert(
+                                f"Lỗi chạy CafeF [{suffix.upper()}]",
+                                f"Không tải được tệp tin ZIP từ máy chủ CafeF cho ngày {date_ref.strftime('%Y-%m-%d')}."
+                            )
+                        except Exception as notify_err:
+                            self.logger.error(f"❌ Không thể gửi thông báo lỗi CafeF: {notify_err}")
                     return None
 
                 try:
@@ -355,6 +364,14 @@ class CafeFExtractorETL:
 
                     if df.empty:
                         self.logger.error("🛑 Pipeline kết thúc sớm do tập dữ liệu sau khi làm sạch trống rỗng.")
+                        if save_checkpoint:
+                            try:
+                                Notifier(self.logger).send_alert(
+                                    f"Lỗi chạy CafeF [{suffix.upper()}]",
+                                    f"Tập dữ liệu sau khi làm sạch trống rỗng cho ngày {date_ref.strftime('%Y-%m-%d')}."
+                                )
+                            except Exception as notify_err:
+                                self.logger.error(f"❌ Không thể gửi thông báo lỗi CafeF: {notify_err}")
                         return None
 
                     self.logger.info(f"✅ Tải và làm sạch dữ liệu thành công! Kích thước: {df.shape}")
@@ -377,7 +394,27 @@ class CafeFExtractorETL:
                         self.storage.save_checkpoint(df)
 
                     self.logger.info(f"🏁 Pipeline hoàn thành xuất sắc! Tổng số dòng xử lý: {df.shape[0]:,}")
+                    if save_checkpoint:
+                        try:
+                            Notifier(self.logger).send_message(
+                                f"✅ <b>BÁO CÁO PIPELINE CAFEF</b>\n"
+                                f"📅 <b>Ngày chạy:</b> {date_ref.strftime('%Y-%m-%d')}\n"
+                                f"📊 <b>Loại dữ liệu:</b> {'Giá thô (Raw)' if is_raw else 'Giá điều chỉnh (Adj)'}\n"
+                                f"📈 <b>Dòng xử lý:</b> {df.shape[0]:,} dòng\n"
+                                f"✨ <b>Trạng thái:</b> Hoàn thành xuất sắc.\n"
+                                f"⏰ <i>Thời gian: {datetime.now(Config.VN_TZ).strftime('%Y-%m-%d %H:%M:%S')}</i>"
+                            )
+                        except Exception as notify_err:
+                            self.logger.error(f"❌ Không thể gửi báo cáo chạy CafeF: {notify_err}")
                     return df
                 except Exception as e:
                     self.logger.error(f"❌ Hệ thống ETL gặp sự cố nghiêm trọng bất ngờ: {e}", exc_info=True)
+                    if save_checkpoint:
+                        try:
+                            Notifier(self.logger).send_alert(
+                                f"Sập Hệ thống CafeF [{suffix.upper()}]",
+                                f"{type(e).__name__}: {str(e)}"
+                            )
+                        except Exception as notify_err:
+                            self.logger.error(f"❌ Không thể gửi thông báo lỗi CafeF: {notify_err}")
                     return None

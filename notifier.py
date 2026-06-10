@@ -30,6 +30,7 @@ class Notifier:
             requests.exceptions.RequestException: Phát sinh khi tất cả các lần thử gửi đều thất bại.
         """
         if not self.telegram_token or not self.telegram_chat_id:
+            self.logger.warning("⚠️ [Telegram] Thiếu cấu hình TELEGRAM_BOT_TOKEN hoặc TELEGRAM_CHAT_ID. Bỏ qua gửi thông báo.")
             return
 
         url: str = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"

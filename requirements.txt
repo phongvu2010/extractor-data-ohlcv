@@ -27,3 +27,4 @@ requests==2.34.2
 rich==15.0.0
 vnstock==4.0.4
 python-dotenv==1.0.1
+db-dtypes==1.7.0

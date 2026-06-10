@@ -353,6 +353,8 @@ class Storage:
         raw_table_ref: str = f"`{self.bq_client.project}.{Config.BQ_DATASET}.{Config.BQ_RAW_TABLE}`"
         adj_table_ref: str = f"`{self.bq_client.project}.{Config.BQ_DATASET}.{Config.BQ_ADJ_TABLE}`"
 
+        self._ensure_table_exists(Config.BQ_RAW_TABLE)
+        self._ensure_table_exists(Config.BQ_ADJ_TABLE)
         self.logger.info(f"⚡ [BigQuery] Đang sao chép giá từ raw sang adjusted cho các ngày: {date_strings}...")
 
         exclude_clause: str = ""
@@ -408,6 +410,7 @@ class Storage:
         date_str: str = date_ref.strftime("%Y-%m-%d") if hasattr(date_ref, "strftime") else str(date_ref)
         table_ref: str = f"`{self.bq_client.project}.{Config.BQ_DATASET}.{table_name}`"
 
+        self._ensure_table_exists(table_name)
         self.logger.info(f"🗑️ [BigQuery] Đang xóa dữ liệu cũ ngày {date_str} từ bảng {table_ref}...")
 
         query: str = f"DELETE FROM {table_ref} WHERE trading_date = '{date_str}'"
