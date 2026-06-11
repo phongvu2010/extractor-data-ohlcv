@@ -503,6 +503,9 @@ class VnstockExtractorETL:
                 else:
                     self.logger.error(f"❌ Không tìm thấy dữ liệu T0 của mã {ticker} trong df_t0 để bù.")
 
+            # Khắc phục trùng lặp ngày trong dữ liệu lịch sử điều chỉnh do lag API
+            df_hist_adj.drop_duplicates(subset=["trading_date"], keep="last", inplace=True)
+
             # Lưu trữ và đồng bộ hóa lên BigQuery
             self.storage.save_symbol_history(df_hist_adj, ticker, suffix="adj")
             self.storage.sync_adjusted_symbol_to_bigquery(ticker)

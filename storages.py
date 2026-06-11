@@ -2,6 +2,7 @@ import gc
 import io
 import json
 import logging
+import re
 from datetime import datetime, date, timedelta
 from typing import Any, Dict, List, Optional, Set, Union
 import numpy as np
@@ -57,6 +58,42 @@ class Storage:
         except Exception as e:
             self.logger.error(f"🛑 [Storage] Lỗi khởi tạo kết nối Cloud Services qua ADC: {e}")
             raise e
+
+        # Tự động quét và dọn dẹp các bảng staging rác của phiên trước
+        self.cleanup_stale_staging_tables()
+
+    def cleanup_stale_staging_tables(self) -> None:
+        """Tìm và dọn dẹp các bảng staging BigQuery còn sót lại từ các lần chạy trước."""
+        dataset_ref = self.bq_client.dataset(Config.BQ_DATASET)
+        try:
+            self.bq_client.get_dataset(dataset_ref)
+        except Exception:
+            return
+
+        prefix = f"{Config.BQ_ADJ_TABLE}_staging_"
+        self.logger.info(f"🧹 [BigQuery] Đang quét các bảng staging còn sót lại với tiền tố '{prefix}'...")
+        
+        try:
+            tables = self.bq_client.list_tables(dataset_ref)
+            stale_tables = []
+            for table in tables:
+                if table.table_id.startswith(prefix):
+                    stale_tables.append(table.table_id)
+            
+            if not stale_tables:
+                self.logger.info("✨ [BigQuery] Không phát hiện bảng staging nào còn sót lại.")
+                return
+
+            self.logger.warning(f"🧹 [BigQuery] Phát hiện {len(stale_tables)} bảng staging còn sót lại: {stale_tables}")
+            for table_id in stale_tables:
+                table_ref = f"{self.bq_client.project}.{Config.BQ_DATASET}.{table_id}"
+                try:
+                    self.bq_client.delete_table(table_ref, not_found_ok=True)
+                    self.logger.info(f"🗑️ [BigQuery] Đã xóa bảng staging: {table_id}")
+                except Exception as del_err:
+                    self.logger.warning(f"⚠️ [BigQuery] Không thể xóa bảng staging {table_id}: {del_err}")
+        except Exception as e:
+            self.logger.error(f"❌ [BigQuery] Lỗi trong quá trình quét dọn bảng staging: {e}")
 
     def save_parquet(
         self,
@@ -580,13 +617,18 @@ class Storage:
             
         content = blob.download_as_text(encoding="utf-8")
         tickers = []
+        ticker_pattern = re.compile(r"^[A-Z0-9]{3,10}$")
         for line in content.splitlines():
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
             # Cho phép các định dạng phân cách bằng khoảng trắng hoặc dấu phẩy
             parts = [p.strip().upper() for p in line.replace(",", " ").split() if p.strip()]
-            tickers.extend(parts)
+            valid_parts = [p for p in parts if ticker_pattern.match(p)]
+            invalid_parts = [p for p in parts if not ticker_pattern.match(p)]
+            if invalid_parts:
+                self.logger.warning(f"⚠️ [Export] Phát hiện mã không hợp lệ bị loại bỏ khỏi danh sách xuất: {invalid_parts}")
+            tickers.extend(valid_parts)
             
         tickers = sorted(list(set(tickers)))
         if not tickers:

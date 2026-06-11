@@ -93,7 +93,7 @@ pip install -r requirements.txt
 ```
 
 ### 2. Bước khởi tạo dữ liệu lịch sử (Chạy một lần duy nhất)
-Mở file [main_cafef.ipynb](file:///Users/hunterdo/Documents/Python Project/Extractor-Data-OHCLV/main_cafef.ipynb) bằng Jupyter Notebook hoặc VS Code, chạy tuần tự các cell để:
+Mở file [main_cafef.ipynb](main_cafef.ipynb) bằng Jupyter Notebook hoặc VS Code, chạy tuần tự các cell để:
 *   Tải toàn bộ dữ liệu lịch sử giá thô và giá điều chỉnh của HOSE, HNX, UPCOM từ máy chủ CafeF.
 *   Ghi các tệp nén Parquet lên GCS.
 *   Khởi tạo cấu trúc bảng trên BigQuery với thiết lập Partition/Cluster và nạp toàn bộ lịch sử vào bảng.
@@ -124,17 +124,17 @@ docker-compose up
 
 ---
 
-## ⏰ Thiết lập Chạy Tự động Hàng ngày (Cronjob)
+## ⏰ Thiết lập Chạy Tự động Hàng ngày (Cronjob - Chạy Local)
 
-Để thiết lập hệ thống tự động cập nhật dữ liệu sau khi kết thúc phiên giao dịch hàng ngày (sau 15:30 chiều), bạn có thể cấu hình cronjob trên Linux/macOS.
+Để thiết lập hệ thống tự động cập nhật dữ liệu sau khi kết thúc phiên giao dịch hàng ngày (sau 20:00 tối), bạn có thể cấu hình cronjob trên Linux/macOS.
 
 Mở công cụ chỉnh sửa cronjob:
 ```bash
 crontab -e
 ```
-Thêm dòng lệnh sau để chạy tự động lúc **15:30 chiều** từ Thứ 2 đến Thứ 6 hằng tuần:
+Thêm dòng lệnh sau để chạy tự động lúc **20:00 tối** từ Thứ 2 đến Thứ 6 hằng tuần:
 ```text
-30 15 * * 1-5 cd "/path/to/your/Extractor-Data-OHCLV" && .venv/bin/python main.py >> cron.log 2>&1
+0 20 * * 1-5 cd "/path/to/your/Extractor-Data-OHCLV" && .venv/bin/python main.py >> cron.log 2>&1
 ```
 *(Hãy thay thế `/path/to/your/Extractor-Data-OHCLV` bằng đường dẫn tuyệt đối đến thư mục chứa dự án trên máy của bạn).*
 
@@ -179,15 +179,18 @@ gcloud run jobs execute vn-stock-daily-job --region asia-southeast1
 ```
 
 ### Bước 5: Lập lịch chạy hàng ngày bằng Cloud Scheduler
-Tạo một cronjob trên Cloud Scheduler để tự động gọi chạy Cloud Run Job vào lúc **15:30 chiều** từ thứ Hai đến thứ Sáu (múi giờ Việt Nam):
+Tạo một cronjob trên Cloud Scheduler để tự động gọi chạy Cloud Run Job vào lúc **20:00 tối** từ thứ Hai đến thứ Sáu (múi giờ Việt Nam):
 ```bash
 gcloud scheduler jobs create http vn-stock-daily-scheduler \
-  --schedule="30 15 * * 1-5" \
+  --schedule="0 20 * * 1-5" \
   --time-zone="Asia/Ho_Chi_Minh" \
   --uri="https://asia-southeast1-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/<YOUR_PROJECT_ID>/jobs/vn-stock-daily-job:run" \
   --http-method=POST \
   --oauth-service-account-email=<YOUR_SERVICE_ACCOUNT_EMAIL>
 ```
+
+> [!TIP]
+> **Tối ưu hóa GCP Free Tier:** Để tận dụng 5 GB Standard Storage miễn phí của GCS và các ưu đãi miễn phí của Cloud Run/Cloud Scheduler, bạn nên chọn vị trí (region) là `us-central1` cho cả GCS Bucket và Cloud Run Job. Đối với một tác vụ ETL chạy batch cuối ngày như dự án này, độ trễ mạng về Mỹ hoàn toàn không ảnh hưởng đến hiệu năng hay kết quả dữ liệu.
 
 ---
 
