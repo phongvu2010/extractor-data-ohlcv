@@ -3,7 +3,7 @@ import io
 import json
 import logging
 import re
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from typing import Any, Dict, List, Optional, Set, Union
 import numpy as np
 import pandas as pd
@@ -49,7 +49,13 @@ class Storage:
         """
         self.logger: logging.Logger = logger
         try:
+            # self.client: storage.Client = storage.Client.from_service_account_json(
+            #     "secrets/credentials.json"
+            # )
             self.client: storage.Client = storage.Client()
+            # self.bq_client: bigquery.Client = bigquery.Client.from_service_account_json(
+            #     "secrets/credentials.json"
+            # )
             self.bq_client: bigquery.Client = bigquery.Client()
             self.bucket: storage.Bucket = self.client.bucket(Config.GCS_BUCKET_NAME)
             self.logger.info("☁️ [GCS] Kết nối thành công bằng Application Default Credentials (ADC).")
@@ -142,6 +148,14 @@ class Storage:
             # Ép kiểu trading_date về Date thuần túy để khớp hoàn hảo với kiểu DATE của BigQuery
             if "trading_date" in df_write.columns:
                 df_write["trading_date"] = pd.to_datetime(df_write["trading_date"]).dt.date
+
+            # Xử lý triệt tiêu số thập phân rác
+            price_cols = ["open_price", "high_price", "low_price", "close_price"]
+            if suffix == "raw":
+                df_write[price_cols] = df_write[price_cols].round(0).astype("Int64")
+            else:
+                df_write[price_cols] = df_write[price_cols].round(2).astype("float64") 
+
             for col in ["symbol", "exchange"]:
                 if col in df_write.columns:
                     df_write[col] = df_write[col].astype(str)
@@ -193,6 +207,10 @@ class Storage:
 
             if "trading_date" in df_write.columns:
                 df_write["trading_date"] = pd.to_datetime(df_write["trading_date"]).dt.date
+
+            price_cols = ["open_price", "high_price", "low_price", "close_price"]
+            df_write[price_cols] = df_write[price_cols].round(2).astype("float64")
+
             for col in ["symbol", "exchange"]:
                 if col in df_write.columns:
                     df_write[col] = df_write[col].astype(str)
@@ -243,6 +261,7 @@ class Storage:
                 bigquery.SchemaField("exchange", "STRING"),
             ]
             table: bigquery.Table = bigquery.Table(table_ref, schema=schema)
+            table.expires = None
             table.time_partitioning = bigquery.TimePartitioning(
                 type_=bigquery.TimePartitioningType.MONTH,
                 field="trading_date"
@@ -267,7 +286,9 @@ class Storage:
         self.logger.info(f"⚡ [BigQuery] Bắt đầu đồng bộ lịch sử điều chỉnh (Staging Mode) cho mã {symbol_upper}...")
 
         target_table_ref: str = f"{self.bq_client.project}.{Config.BQ_DATASET}.{Config.BQ_ADJ_TABLE}"
-        staging_table_name: str = f"{Config.BQ_ADJ_TABLE}_staging_{symbol_upper}"
+        # Thay thế ký tự không hợp lệ cho tên bảng BigQuery (chỉ giữ lại chữ cái, số và dấu gạch dưới)
+        clean_symbol: str = re.sub(r"[^a-zA-Z0-9_]", "_", symbol_upper)
+        staging_table_name: str = f"{Config.BQ_ADJ_TABLE}_staging_{clean_symbol}"
         staging_table_ref: str = f"{self.bq_client.project}.{Config.BQ_DATASET}.{staging_table_name}"
 
         # Đảm bảo bảng đích đã sẵn sàng hoạt động

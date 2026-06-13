@@ -6,7 +6,7 @@ import random
 import time
 import zipfile
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set
 import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
@@ -214,7 +214,7 @@ class DataProcessor:
         chunk[price_cols] *= Config.PRICE_MULTIPLIER
 
         # Ép kiểu dữ liệu dung lượng nhỏ để tối ưu hóa bộ nhớ RAM
-        chunk[price_cols] = chunk[price_cols].astype("float32")
+        chunk[price_cols] = chunk[price_cols].round(2).astype("float32")
         chunk["total_volume"] = chunk["total_volume"].astype("Int32")
 
         # Áp dụng chốt chặn logic toán học để loại bỏ các dòng bị lỗi cấu trúc dữ liệu

@@ -89,11 +89,6 @@ class Config:
     API_REQUEST_THRESHOLD: int = _get_env_int("API_REQUEST_THRESHOLD", 18)
     API_RATE_LIMIT_WINDOW: float = _get_env_float("API_RATE_LIMIT_WINDOW", 60.0)
     API_MICRO_SLEEP: float = _get_env_float("API_MICRO_SLEEP", 3.5)
-    BACKFILL_LIMIT: int = _get_env_int("BACKFILL_LIMIT", -1)
-
-    # Ngưỡng lệch giá để phát hiện sự kiện doanh nghiệp (dạng phần trăm, ví dụ: 0.005 = 0.5%, 0.01 = 1%)
-    PRICE_DEV_THRESHOLD_HOSE_HNX: float = _get_env_float("PRICE_DEV_THRESHOLD_HOSE_HNX", 0.005)
-    PRICE_DEV_THRESHOLD_UPCOM: float = _get_env_float("PRICE_DEV_THRESHOLD_UPCOM", 0.01)
 
     # Cảnh báo qua Telegram
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")

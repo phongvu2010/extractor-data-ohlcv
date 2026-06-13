@@ -1,7 +1,6 @@
 import logging
 from datetime import date, datetime, timedelta
-from typing import Any, Dict, List, Optional, Set, Tuple
-import numpy as np
+from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 import requests
 import time
@@ -131,7 +130,7 @@ class DataProcessor:
         df_all["total_volume"] = df_all["volume_accumulated"]
 
         # Loại bỏ các dòng chứa giá trị lỗi hoặc thiếu tham số giao dịch quan trọng
-        df_all = df_all.dropna(subset=["open_price", "high_price", "low_price", "close_price", "total_volume"])
+        df_all = df_all.dropna(subset=["open_price", "high_price", "low_price", "close_price", "total_volume", "trading_date"])
         df_all = df_all[
             ~(
                 (df_all["open_price"] <= 0)
@@ -462,6 +461,7 @@ class VnstockExtractorETL:
                 pd.CategoricalDtype(categories=["HoSE", "HNX", "UPCoM", "Unknown"])
             )
             df_hist_adj["trading_date"] = pd.to_datetime(df_hist_adj["trading_date"]).dt.normalize()
+            df_hist_adj = df_hist_adj.dropna(subset=["trading_date"])
 
             price_cols: List[str] = ["open_price", "high_price", "low_price", "close_price"]
             df_hist_adj[price_cols] = df_hist_adj[price_cols].astype("float32")
@@ -514,6 +514,71 @@ class VnstockExtractorETL:
             self.logger.error(f"❌ Lỗi khi tải lại lịch sử mã {ticker}: {e}", exc_info=True)
             return False
 
+    def verify_price_units(self, symbols_map: Dict[str, str]) -> float:
+        """Kiểm tra sự đồng nhất đơn vị giá giữa price_board và ohlcv.
+
+        Returns:
+            Hệ số nhân cần áp dụng cho bảng giá T0 (thường là 1000.0 nếu lệch hoặc 1.0 nếu đồng nhất).
+        """
+        default_multiplier: float = 1.0
+        if not symbols_map:
+            return default_multiplier
+
+        # Chọn mã benchmark (ưu tiên FPT, hoặc lấy mã đầu tiên có 3 ký tự)
+        ticker: str = "FPT"
+        if ticker not in symbols_map:
+            ticker = next((s for s in symbols_map.keys() if len(s) == 3), "")
+
+        if not ticker:
+            return default_multiplier
+
+        try:
+            # 1. Lấy giá từ bảng giá T0
+            df_board: Optional[pd.DataFrame] = self.processor.trading_api.price_board([ticker])
+            if df_board is None or df_board.empty:
+                self.logger.warning(f"⚠️ [Unit Check] Không thể lấy bảng giá {ticker} để kiểm tra đơn vị. Sử dụng hệ số mặc định 1.0")
+                return default_multiplier
+            board_price: float = float(df_board.iloc[0]["close_price"])
+
+            # 2. Lấy giá ohlcv lịch sử gần đây (sử dụng hàm fetch_ohlcv đã qua xử lý nhân multiplier)
+            today_str: str = datetime.now(Config.VN_TZ).strftime("%Y-%m-%d")
+            start_date: str = (datetime.now(Config.VN_TZ) - timedelta(days=7)).strftime("%Y-%m-%d")
+
+            df_ohlcv: Optional[pd.DataFrame] = self.processor.fetch_ohlcv(
+                ticker, start_date=start_date, end_date=today_str, limit=5
+            )
+            if df_ohlcv is None or df_ohlcv.empty:
+                self.logger.warning(f"⚠️ [Unit Check] Không thể lấy dữ liệu OHLCV {ticker} để kiểm tra đơn vị. Sử dụng hệ số mặc định 1.0")
+                return default_multiplier
+
+            ohlcv_price: float = float(df_ohlcv.iloc[-1]["close_price"])
+
+            if board_price <= 0 or ohlcv_price <= 0:
+                return default_multiplier
+
+            ratio: float = board_price / ohlcv_price
+            self.logger.info(f"🔍 [Price Unit Check] Giá {ticker} - Bảng giá: {board_price:,.2f} | OHLCV đã xử lý: {ohlcv_price:,.2f} | Tỷ lệ: {ratio:.4f}")
+
+            # Đánh giá sự đồng nhất đơn vị
+            if 0.0008 <= ratio <= 0.0012:
+                self.logger.warning(
+                    f"⚠️ LỆCH ĐƠN VỊ GIÁ: Phát hiện giá bảng điện tử ({board_price:,.2f}) nhỏ hơn 1000 lần "
+                    f"so với dữ liệu OHLCV ({ohlcv_price:,.2f}). Sẽ tự động áp dụng hệ số nhân 1000 cho bảng giá T0."
+                )
+                return 1000.0
+            elif 0.8 <= ratio <= 1.2:
+                self.logger.info("✅ Xác nhận đơn vị giá nhất quán giữa Bảng giá và dữ liệu OHLCV. Hệ số nhân: 1.0")
+                return 1.0
+            else:
+                self.logger.warning(
+                    f"⚠️ [Unit Check] Tỷ lệ giá trị bất thường: {ratio:.4f}. "
+                    f"(Bảng giá: {board_price} vs OHLCV: {ohlcv_price}). Sử dụng hệ số mặc định 1.0"
+                )
+                return default_multiplier
+        except Exception as e:
+            self.logger.error(f"❌ Lỗi trong quá trình kiểm tra tự động đơn vị giá: {e}", exc_info=True)
+            return default_multiplier
+
     def run(self) -> Optional[pd.DataFrame]:
         """Khởi chạy toàn bộ quy trình ETL tải dữ liệu daily, backfill, xử lý sự kiện và đồng bộ lên GCP.
 
@@ -521,12 +586,19 @@ class VnstockExtractorETL:
             DataFrame dữ liệu giao dịch T0 ngày hôm nay nếu thành công, ngược lại trả về None.
         """
         symbols_map: Dict[str, str] = self.processor.get_symbols_with_exchange()
+        t0_multiplier: float = self.verify_price_units(symbols_map)
         symbols: List[str] = list(symbols_map.keys())
 
         df_t0: pd.DataFrame = self.processor.fetch_entire_market_t0(symbols)
         if df_t0.empty:
             self.logger.warning("⚠️ Không lấy được dữ liệu T0. Dừng pipeline.")
             return None
+
+        # Áp dụng hệ số nhân đơn vị giá động sau khi tự động kiểm tra
+        if t0_multiplier != 1.0:
+            self.logger.info(f"⚡ Áp dụng hệ số nhân {t0_multiplier} cho dữ liệu giá T0 nhằm đồng nhất đơn vị.")
+            price_cols = ["open_price", "high_price", "low_price", "close_price", "reference_price", "average_price"]
+            df_t0[price_cols] *= t0_multiplier
 
         # 1. Khởi tạo và kiểm tra trạng thái lịch chạy gần nhất
         init_res = self._initialize_run_dates(df_t0)
