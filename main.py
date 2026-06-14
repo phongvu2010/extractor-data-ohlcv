@@ -1,9 +1,11 @@
-import logging
 from datetime import datetime
+import logging
+import os
+
 from config import Config
 from extractors.extractor_vnstock import VnstockExtractorETL
-from utils import setup_logger
 from notifier import Notifier
+from utils import setup_logger
 
 
 def main() -> None:
@@ -15,12 +17,19 @@ def main() -> None:
     logger: logging.Logger = setup_logger(Config.DEFAULT_LOGGER_NAME)
     logger.info("[bold cyan]🚀 === KHỞI ĐỘNG PIPELINE (DAILY MODE) ===[/bold cyan]")
 
+    if "K_SERVICE" in os.environ and "K_JOB" not in os.environ:
+        logger.warning(
+            "[yellow]⚠️ CẢNH BÁO: Phát hiện đang chạy dưới dạng Cloud Run Service. "
+            "Cơ chế sleep của Rate Limiter có thể bị ảnh hưởng bởi việc throttle CPU. "
+            "Khuyến nghị triển khai dưới dạng Cloud Run Job.[/yellow]"
+        )
+
     try:
         # Chốt chặn thời gian: Bỏ qua chạy tự động vào các ngày cuối tuần và ngày lễ
         today_date: datetime = datetime.now(Config.VN_TZ)
 
         # 1. Chặn Thứ 7 và Chủ Nhật theo hàm weekday()
-        if today_date.weekday() >= 5 and not Config.FORCE_RUN_WEEKEND:
+        if today_date.weekday() >= 5 and not Config.FORCE_RUN:
             skip_msg: str = (
                 f"⏸️ Bỏ qua chạy DAILY: Hôm nay là cuối tuần ({today_date.strftime('%A')}). "
                 "Thị trường đóng cửa."
@@ -30,7 +39,7 @@ def main() -> None:
 
         # 2. Chặn các ngày nghỉ lễ của Việt Nam theo lịch cấu hình
         today_date_str: str = today_date.strftime("%Y-%m-%d")
-        if today_date_str in Config.VN_HOLIDAY_DATES and not Config.FORCE_RUN_WEEKEND:
+        if today_date_str in Config.get_vn_holiday_dates() and not Config.FORCE_RUN:
             skip_msg = (
                 f"⏸️ Bỏ qua chạy DAILY: Hôm nay ({today_date_str}) là ngày nghỉ Lễ Quốc gia. "
                 "Thị trường đóng cửa."

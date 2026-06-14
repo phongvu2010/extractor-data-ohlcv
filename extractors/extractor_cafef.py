@@ -1,25 +1,29 @@
 import contextlib
+from datetime import datetime
 import gc
 import io
 import logging
 import random
+from typing import Any, Dict, Iterator, List, Optional, Set
 import time
 import zipfile
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Set
+
 import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 
 from config import Config
+from notifier import Notifier
 from storages import Storage
 from utils import normalize_exchange, setup_logger
-from notifier import Notifier
 
 
 class Downloader:
     """Chuyên trách việc giao tiếp mạng, tải tệp và trích xuất luồng dữ liệu ZIP từ CafeF."""
+
+    logger: logging.Logger
+    session: requests.Session
 
     def __init__(self, logger: logging.Logger) -> None:
         """Khởi tạo bộ tải dữ liệu.
@@ -27,8 +31,8 @@ class Downloader:
         Args:
             logger: Đối tượng Logger dùng để ghi nhận tiến trình.
         """
-        self.logger: logging.Logger = logger
-        self.session: requests.Session = requests.Session()
+        self.logger = logger
+        self.session = requests.Session()
 
         # Giả lập Header thông dụng để tránh bị chặn bởi các cơ chế bot filter cơ bản của CDN
         self.session.headers.update({
@@ -62,7 +66,7 @@ class Downloader:
         """Tự động đóng session giải phóng connection pool khi thoát khối lệnh with."""
         if self.session:
             self.session.close()
-            self.logger.info("🔌 [Downloader] Đã đóng tài nguyên kết nối mạng an toàn.")
+            self.logger.info("🔌 [Downloader] Đã đóng tài nguyên kết nối mạng an toàn sau khi sử dụng.")
 
     def download_zip_stream(self, date_ref: datetime, is_raw: bool) -> Optional[io.BytesIO]:
         """Tải tệp zip chứa dữ liệu lịch sử từ CafeF về bộ nhớ đệm RAM.
@@ -104,7 +108,7 @@ class Downloader:
 
                 # Vòng kiểm tra 2: Kiểm tra Magic Bytes đầu tiên của định dạng file ZIP (Hex: 50 4B 03 04)
                 zip_magic_start: bytes = b"PK\x03\x04"
-                stream_iterator = response.iter_content(chunk_size=65536)
+                stream_iterator: Iterator[bytes] = response.iter_content(chunk_size=65536)
 
                 try:
                     first_chunk: bytes = next(stream_iterator)
@@ -146,14 +150,20 @@ class Downloader:
 class DataProcessor:
     """Chuyên trách việc làm sạch, chuẩn hóa và ép kiểu dữ liệu chứng khoán lịch sử từ CSV."""
 
-    def __init__(self, logger: logging.Logger) -> None:
+    logger: logging.Logger
+    storage: Optional[Storage]
+    blacklist: Set[str]
+
+    def __init__(self, logger: logging.Logger, storage: Optional[Storage] = None) -> None:
         """Khởi tạo bộ xử lý dữ liệu và tải danh sách đen (Blacklist) loại bỏ các mã không hợp lệ.
 
         Args:
             logger: Đối tượng Logger dùng để ghi nhận tiến trình.
+            storage: Đối tượng Storage dùng để đọc blacklist từ GCS.
         """
-        self.logger: logging.Logger = logger
-        self.blacklist: Set[str] = self._load_blacklist()
+        self.logger = logger
+        self.storage = storage
+        self.blacklist = self._load_blacklist()
 
     def _load_blacklist(self) -> Set[str]:
         """Tải tập hợp danh sách các mã rác, mã ảo cần loại bỏ.
@@ -161,11 +171,23 @@ class DataProcessor:
         Returns:
             Set chứa các mã chứng khoán viết hoa thuộc danh sách đen.
         """
+        if self.storage:
+            try:
+                return self.storage.read_blacklist()
+            except Exception as e:
+                self.logger.warning(
+                    f"⚠️ [CafeF] Lỗi khi đọc blacklist qua Storage: {e}. Thử đọc trực tiếp file cục bộ..."
+                )
+
         try:
             with open("blacklist.txt", "r", encoding="utf-8") as file:
-                return {line.strip().upper() for line in file if line.strip()}
+                return {
+                    line.strip().upper()
+                    for line in file
+                    if line.strip() and not line.strip().startswith("#")
+                }
         except FileNotFoundError:
-            self.logger.warning("⚠️ [CafeF] Không tìm thấy file 'blacklist.txt'. Bỏ qua bộ lọc danh sách đen.")
+            self.logger.warning("⚠️ [CafeF] Không tìm thấy file 'blacklist.txt' cục bộ. Bỏ qua bộ lọc danh sách đen.")
             return set()
 
     def _get_column_names(self, include_exchange: bool = True) -> List[str]:
@@ -177,7 +199,9 @@ class DataProcessor:
         Returns:
             Danh sách tên cột.
         """
-        cols: List[str] = ["symbol", "trading_date", "open_price", "high_price", "low_price", "close_price", "total_volume"]
+        cols: List[str] = [
+            "symbol", "trading_date", "open_price", "high_price", "low_price", "close_price", "total_volume"
+        ]
         if include_exchange:
             cols.append("exchange")
         return cols
@@ -204,9 +228,8 @@ class DataProcessor:
             if chunk.empty:
                 return chunk
 
-        chunk["exchange"] = pd.Categorical(
-            [exchange_name] * len(chunk),
-            categories=["HoSE", "HNX", "UPCoM", "Unknown"]
+        chunk["exchange"] = pd.Series(exchange_name, index=chunk.index).astype(
+            pd.CategoricalDtype(categories=["HoSE", "HNX", "UPCoM", "Unknown"])
         )
 
         # Nhân giá thô với hệ số quy đổi (thường là 1000) để khớp đơn vị
@@ -215,7 +238,7 @@ class DataProcessor:
 
         # Ép kiểu dữ liệu dung lượng nhỏ để tối ưu hóa bộ nhớ RAM
         chunk[price_cols] = chunk[price_cols].round(2).astype("float32")
-        chunk["total_volume"] = chunk["total_volume"].astype("Int32")
+        chunk["total_volume"] = chunk["total_volume"].astype("Int64")
 
         # Áp dụng chốt chặn logic toán học để loại bỏ các dòng bị lỗi cấu trúc dữ liệu
         valid_mask: pd.Series = (
@@ -265,7 +288,7 @@ class DataProcessor:
                     with io.TextIOWrapper(f, encoding="utf-8") as text_stream:
                         try:
                             # Phân tích định dạng ngày ngay ở C-Engine để tối đa hóa tốc độ tải dữ liệu
-                            chunks = pd.read_csv(
+                            chunks: pd.io.parsers.TextFileReader = pd.read_csv(
                                 text_stream,
                                 header=0,
                                 names=cols_order,
@@ -310,15 +333,24 @@ class DataProcessor:
 class CafeFExtractorETL:
     """Bộ điều phối chính (Orchestrator) quản lý toàn bộ vòng đời chạy của CafeF Pipeline."""
 
-    def __init__(self, logger_name: str = Config.DEFAULT_LOGGER_NAME) -> None:
+    logger: logging.Logger
+    storage: Storage
+    processor: DataProcessor
+
+    def __init__(
+        self,
+        logger_name: str = Config.DEFAULT_LOGGER_NAME,
+        storage: Optional[Storage] = None,
+    ) -> None:
         """Khởi tạo đối tượng ETL và cấu hình kết nối các phân lớp.
 
         Args:
             logger_name: Tên Logger hệ thống dùng chung.
+            storage: Đối tượng Storage chia sẻ kết nối GCP.
         """
-        self.logger: logging.Logger = setup_logger(logger_name)
-        self.processor: DataProcessor = DataProcessor(self.logger)
-        self.storage: Storage = Storage(self.logger)
+        self.logger = setup_logger(logger_name)
+        self.storage = storage or Storage(self.logger)
+        self.processor = DataProcessor(self.logger, storage=self.storage)
 
     def run(
         self,
@@ -382,13 +414,14 @@ class CafeFExtractorETL:
                     if gcs_path:
                         target_table: str = Config.BQ_RAW_TABLE if is_raw else Config.BQ_ADJ_TABLE
                         if partition:
-                            self.storage.delete_by_date(target_table, date_ref)
-                            self.storage.load_parquet_to_bigquery(gcs_path, target_table, write_disposition="WRITE_APPEND")
+                            self.storage.sync_partition_to_bigquery(gcs_path, target_table, date_ref.date())
                         else:
                             self.logger.warning(
                                 f"⚠️ Đang nạp toàn bộ lịch sử ở chế độ WRITE_TRUNCATE cho bảng {target_table}..."
                             )
-                            self.storage.load_parquet_to_bigquery(gcs_path, target_table, write_disposition="WRITE_TRUNCATE")
+                            self.storage.load_parquet_to_bigquery(
+                                gcs_path, target_table, write_disposition="WRITE_TRUNCATE"
+                            )
 
                     if is_raw and save_checkpoint:
                         self.storage.save_checkpoint(df)

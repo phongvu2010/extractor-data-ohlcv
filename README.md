@@ -161,16 +161,28 @@ gcloud builds submit --tag asia-southeast1-docker.pkg.dev/<YOUR_PROJECT_ID>/vn-s
 *(Thay thế `<YOUR_PROJECT_ID>` bằng ID dự án GCP thực tế của bạn).*
 
 ### Bước 3: Tạo Cloud Run Job
-Tạo một Job trên Cloud Run dựa vào Docker Image vừa đẩy lên:
-```bash
-gcloud run jobs create vn-stock-daily-job \
-  --image asia-southeast1-docker.pkg.dev/<YOUR_PROJECT_ID>/vn-stock-repo/vn-stock-etl:latest \
-  --region asia-southeast1 \
-  --service-account=<YOUR_SERVICE_ACCOUNT_EMAIL> \
-  --set-env-vars="GCS_BUCKET_NAME=vn-stock,BQ_DATASET=vn_stock_dataset,TELEGRAM_BOT_TOKEN=<YOUR_TOKEN>,TELEGRAM_CHAT_ID=<YOUR_CHAT_ID>"
-```
-> [!TIP]
-> Hãy cấp quyền cho Service Account chạy Job này các vai trò cần thiết tương ứng với GCS và BigQuery (như `Storage Admin`, `BigQuery Admin` hoặc các vai trò chi tiết như ở Bước 1 của mục cấu hình).
+1. **Lưu trữ Secrets trên Google Cloud Secret Manager** (khuyên dùng để bảo mật):
+   Tạo hai secret trên Secret Manager để lưu thông tin Telegram:
+   ```bash
+   echo -n "<YOUR_TELEGRAM_BOT_TOKEN>" | gcloud secrets create TELEGRAM_BOT_TOKEN --data-file=-
+   echo -n "<YOUR_TELEGRAM_CHAT_ID>" | gcloud secrets create TELEGRAM_CHAT_ID --data-file=-
+   ```
+   *Lưu ý: Hãy cấp quyền `Secret Manager Secret Accessor` (Quyền truy cập bí mật của Secret Manager) cho Service Account chạy Job để nó có thể giải mã bí mật khi container khởi chạy.*
+
+2. **Khởi tạo Cloud Run Job**:
+   Tạo Job dựa vào Docker Image đã đẩy lên, cấu hình mount secrets trực tiếp vào thư mục `/secrets` (mã nguồn được thiết kế để tự động nhận diện và đọc bảo mật từ đây):
+   ```bash
+   gcloud run jobs create vn-stock-daily-job \
+     --image asia-southeast1-docker.pkg.dev/<YOUR_PROJECT_ID>/vn-stock-repo/vn-stock-etl:latest \
+     --region asia-southeast1 \
+     --service-account=<YOUR_SERVICE_ACCOUNT_EMAIL> \
+     --set-env-vars="GCS_BUCKET_NAME=vn-stock,BQ_DATASET=vn_stock_dataset" \
+     --set-secrets="TELEGRAM_BOT_TOKEN=TELEGRAM_BOT_TOKEN:latest,TELEGRAM_CHAT_ID=TELEGRAM_CHAT_ID:latest"
+   ```
+
+   > [!TIP]
+   > * Bằng cách dùng tham số `--set-secrets`, Cloud Run sẽ tự động mount các secret dưới dạng file tại `/secrets/TELEGRAM_BOT_TOKEN` và `/secrets/TELEGRAM_CHAT_ID`. Code của hệ thống sẽ tự động ưu tiên đọc từ file mount này trước khi fallback về biến môi trường thông thường.
+   > * Hãy cấp quyền cho Service Account chạy Job này các vai trò cần thiết tương ứng với GCS và BigQuery (như `Storage Admin`, `BigQuery Admin` hoặc các vai trò chi tiết như ở Bước 1 của mục cấu hình).
 
 ### Bước 4: Chạy thử nghiệm Job thủ công
 Kiểm tra xem Job có hoạt động thành công hay không bằng cách kích hoạt chạy ngay lập tức:

@@ -16,15 +16,21 @@
 
 # pip3 freeze > requirements.txt
 
-
-### Package
-holidays==0.98
+# Google Cloud Services
 google-cloud-bigquery==3.41.0
 google-cloud-storage==3.11.0
+db-dtypes==1.7.0
+
+# Xử lý dữ liệu & Parquet
 pandas==2.3.3
 pyarrow==24.0.0
-requests==2.34.2
-rich==15.0.0
+pytz==2026.2
+
+# Cào dữ liệu & APIs
 vnstock==4.0.4
+requests==2.34.2
+holidays==0.98
+
+# Cấu hình, Logging & Tiện ích
 python-dotenv==1.0.1
-db-dtypes==1.7.0
+rich==15.0.0

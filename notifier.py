@@ -1,8 +1,11 @@
-import logging
-import time
 from datetime import datetime
+import html
+import logging
 from typing import Any, Dict, List, Optional, Union
+import time
+
 import requests
+
 from config import Config
 from utils import setup_logger
 
@@ -30,22 +33,25 @@ class Notifier:
             requests.exceptions.RequestException: Phát sinh khi tất cả các lần thử gửi đều thất bại.
         """
         if not self.telegram_token or not self.telegram_chat_id:
-            self.logger.warning("⚠️ [Telegram] Thiếu cấu hình TELEGRAM_BOT_TOKEN hoặc TELEGRAM_CHAT_ID. Bỏ qua gửi thông báo.")
+            self.logger.warning(
+                "⚠️ [Telegram] Thiếu cấu hình TELEGRAM_BOT_TOKEN hoặc TELEGRAM_CHAT_ID. Bỏ qua gửi thông báo."
+            )
             return
 
         url: str = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
-        payload: Dict[str, Union[str, bool]] = {
+        payload: Dict[str, Any] = {
             "chat_id": self.telegram_chat_id,
             "text": text,
             "parse_mode": "HTML",
-            "disable_web_page_preview": True,
+            "link_preview_options": {"is_disabled": True},
         }
 
         max_retries: int = 3
         backoff_delay: float = 2.0
+        telegram_timeout: int = min(8, Config.NETWORK_TIMEOUT)
         for attempt in range(1, max_retries + 1):
             try:
-                response: requests.Response = requests.post(url, json=payload, timeout=Config.NETWORK_TIMEOUT)
+                response: requests.Response = requests.post(url, json=payload, timeout=telegram_timeout)
                 response.raise_for_status()
                 self.logger.info("📲 [Telegram] Gửi tin nhắn thành công.")
                 return
@@ -75,11 +81,13 @@ class Notifier:
             subject: Tiêu đề hoặc nguồn gốc phát sinh lỗi cảnh báo.
             message: Chi tiết lỗi hoặc stack trace của ngoại lệ.
         """
+        escaped_subject: str = html.escape(subject)
+        escaped_message: str = html.escape(message)
         formatted_msg: str = (
-            f"🚨 <b>CẢNH BÁO PIPELINE: {subject}</b>\n\n"
+            f"🚨 <b>CẢNH BÁO PIPELINE: {escaped_subject}</b>\n\n"
             f"📍 <b>Chi tiết:</b>\n"
-            f"<code>{message}</code>\n\n"
-            f"⏰ <i>Thời gian: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</i>"
+            f"<code>{escaped_message}</code>\n\n"
+            f"⏰ <i>Thời gian: {datetime.now(Config.VN_TZ).strftime('%Y-%m-%d %H:%M:%S')}</i>"
         )
         self.send_message(formatted_msg)
 
@@ -140,6 +148,6 @@ class Notifier:
                 f"📄 <b>Dòng Giá Điều chỉnh:</b> {export_summary['adj_rows']:,} dòng\n"
             )
 
-        formatted_msg += f"\n⏰ <i>Thời gian chạy: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</i>"
+        formatted_msg += f"\n⏰ <i>Thời gian chạy: {datetime.now(Config.VN_TZ).strftime('%Y-%m-%d %H:%M:%S')}</i>"
 
         self.send_message(formatted_msg)
