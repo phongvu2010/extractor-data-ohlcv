@@ -190,11 +190,12 @@ class DataProcessor:
             self.logger.warning("⚠️ [CafeF] Không tìm thấy file 'blacklist.txt' cục bộ. Bỏ qua bộ lọc danh sách đen.")
             return set()
 
-    def _get_column_names(self, include_exchange: bool = True) -> List[str]:
+    def _get_column_names(self, include_exchange: bool = True, include_source: bool = False) -> List[str]:
         """Lấy danh sách tên các cột dữ liệu theo thứ tự chuẩn.
 
         Args:
             include_exchange: Có bao gồm cột thông tin sàn giao dịch 'exchange' hay không.
+            include_source: Có bao gồm cột thông tin nguồn dữ liệu 'source' hay không.
 
         Returns:
             Danh sách tên cột.
@@ -204,6 +205,8 @@ class DataProcessor:
         ]
         if include_exchange:
             cols.append("exchange")
+        if include_source:
+            cols.append("source")
         return cols
 
     def _clean_chunk(self, chunk: pd.DataFrame, exchange_name: str) -> pd.DataFrame:
@@ -231,6 +234,7 @@ class DataProcessor:
         chunk["exchange"] = pd.Series(exchange_name, index=chunk.index).astype(
             pd.CategoricalDtype(categories=["HoSE", "HNX", "UPCoM", "Unknown"])
         )
+        chunk["source"] = "cafef"
 
         # Nhân giá thô với hệ số quy đổi (thường là 1000) để khớp đơn vị
         price_cols: List[str] = ["open_price", "high_price", "low_price", "close_price"]
@@ -261,8 +265,8 @@ class DataProcessor:
         Returns:
             DataFrame hoàn chỉnh đã chuẩn hóa toàn bộ dữ liệu.
         """
-        cols_order: List[str] = self._get_column_names(include_exchange=False)
-        final_cols_order: List[str] = self._get_column_names(include_exchange=True)
+        cols_order: List[str] = self._get_column_names(include_exchange=False, include_source=False)
+        final_cols_order: List[str] = self._get_column_names(include_exchange=True, include_source=True)
 
         csv_dtypes: Dict[str, str] = {
             "symbol": "str",

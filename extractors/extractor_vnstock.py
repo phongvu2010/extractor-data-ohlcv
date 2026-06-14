@@ -169,6 +169,7 @@ class DataProcessor:
         df_all["reference_price"] = df_all["reference_price"].astype("float32")
         df_all["average_price"] = df_all["average_price"].astype("float32")
         df_all["total_volume"] = df_all["total_volume"].astype("Int64")
+        df_all["source"] = self.source.lower()
 
         return df_all[
             [
@@ -180,6 +181,7 @@ class DataProcessor:
                 "close_price",
                 "total_volume",
                 "exchange",
+                "source",
                 "reference_price",
                 "average_price",
             ]
@@ -228,6 +230,7 @@ class DataProcessor:
                     # Quy đổi đơn vị giá Vnstock (nghìn đồng) về đồng giống file CafeF
                     price_cols: List[str] = ["open_price", "high_price", "low_price", "close_price"]
                     df_ohclv[price_cols] *= Config.PRICE_MULTIPLIER
+                    df_ohclv["source"] = src.lower()
 
                     return df_ohclv
             except Exception as e:
@@ -528,7 +531,7 @@ class VnstockExtractorETL:
 
             target_cols: List[str] = [
                 "symbol", "trading_date", "open_price", "high_price", "low_price", "close_price",
-                "total_volume", "exchange"
+                "total_volume", "exchange", "source"
             ]
             df_hist_adj = df_hist_adj[target_cols]
 
@@ -550,7 +553,8 @@ class VnstockExtractorETL:
                         "low_price": t0_row["low_price"],
                         "close_price": t0_row["close_price"],
                         "total_volume": t0_row["total_volume"],
-                        "exchange": symbols_map.get(ticker, "Unknown")
+                        "exchange": symbols_map.get(ticker, "Unknown"),
+                        "source": t0_row.get("source", self.source.lower())
                     }])
                     df_t0_append["symbol"] = df_t0_append["symbol"].astype(str).str.strip().str.upper().astype(
                         "category"

@@ -143,7 +143,7 @@ class Storage:
         if "total_volume" in df_write.columns:
             df_write["total_volume"] = df_write["total_volume"].astype("Int64")
 
-        for col in ["symbol", "exchange"]:
+        for col in ["symbol", "exchange", "source"]:
             if col in df_write.columns:
                 df_write[col] = df_write[col].astype(str)
 
@@ -291,6 +291,7 @@ class Storage:
                 bigquery.SchemaField("close_price", price_type),
                 bigquery.SchemaField("total_volume", "INTEGER"),
                 bigquery.SchemaField("exchange", "STRING"),
+                bigquery.SchemaField("source", "STRING"),
             ]
             table: bigquery.Table = bigquery.Table(table_ref, schema=schema)
             table.expires = None
@@ -377,9 +378,9 @@ class Storage:
 
             # Sao chép toàn bộ dữ liệu từ bảng tạm sang bảng chính
             INSERT INTO `{target_table_ref}` (
-              symbol, trading_date, open_price, high_price, low_price, close_price, total_volume, exchange
+              symbol, trading_date, open_price, high_price, low_price, close_price, total_volume, exchange, source
             )
-            SELECT symbol, trading_date, open_price, high_price, low_price, close_price, total_volume, exchange
+            SELECT symbol, trading_date, open_price, high_price, low_price, close_price, total_volume, exchange, source
             FROM `{staging_table_ref}`;
 
             COMMIT TRANSACTION;
@@ -481,9 +482,9 @@ class Storage:
 
             # Sao chép toàn bộ dữ liệu từ bảng tạm sang bảng chính
             INSERT INTO `{target_table_ref}` (
-              symbol, trading_date, open_price, high_price, low_price, close_price, total_volume, exchange
+              symbol, trading_date, open_price, high_price, low_price, close_price, total_volume, exchange, source
             )
-            SELECT symbol, trading_date, open_price, high_price, low_price, close_price, total_volume, exchange
+            SELECT symbol, trading_date, open_price, high_price, low_price, close_price, total_volume, exchange, source
             FROM `{staging_table_ref}`;
 
             COMMIT TRANSACTION;
@@ -611,9 +612,9 @@ class Storage:
 
             # Sao chép toàn bộ dữ liệu từ bảng tạm sang bảng chính
             INSERT INTO `{target_table_ref}` (
-              symbol, trading_date, open_price, high_price, low_price, close_price, total_volume, exchange
+              symbol, trading_date, open_price, high_price, low_price, close_price, total_volume, exchange, source
             )
-            SELECT symbol, trading_date, open_price, high_price, low_price, close_price, total_volume, exchange
+            SELECT symbol, trading_date, open_price, high_price, low_price, close_price, total_volume, exchange, source
             FROM `{staging_table_ref}`;
 
             COMMIT TRANSACTION;
@@ -687,7 +688,7 @@ class Storage:
 
         # Chèn giá thô ngày T từ raw_price sang adjusted_price đối với các mã bình thường
         INSERT INTO {adj_table_ref}
-          (symbol, trading_date, open_price, high_price, low_price, close_price, total_volume, exchange)
+          (symbol, trading_date, open_price, high_price, low_price, close_price, total_volume, exchange, source)
         SELECT
           symbol,
           trading_date,
@@ -696,7 +697,8 @@ class Storage:
           low_price,
           close_price,
           total_volume,
-          exchange
+          exchange,
+          source
         FROM {raw_table_ref}
         WHERE trading_date IN UNNEST(@dates) {exclude_clause};
 
@@ -962,7 +964,7 @@ class Storage:
                 batch_tickers: List[str] = tickers[i : i + batch_size]
                 self.logger.info(f"   ↳ Đang xử lý nhóm Giá Thô {i // batch_size + 1}: {len(batch_tickers)} mã...")
                 raw_query: str = f"""
-                    SELECT symbol, trading_date, open_price, high_price, low_price, close_price, total_volume, exchange
+                    SELECT symbol, trading_date, open_price, high_price, low_price, close_price, total_volume, exchange, source
                     FROM `{self.bq_client.project}.{Config.BQ_DATASET}.{Config.BQ_RAW_TABLE}`
                     WHERE symbol IN UNNEST(@tickers)
                       AND trading_date >= @start_date
@@ -1000,7 +1002,7 @@ class Storage:
                     f"   ↳ Đang xử lý nhóm Giá Điều Chỉnh {i // batch_size + 1}: {len(batch_tickers)} mã..."
                 )
                 adj_query: str = f"""
-                    SELECT symbol, trading_date, open_price, high_price, low_price, close_price, total_volume, exchange
+                    SELECT symbol, trading_date, open_price, high_price, low_price, close_price, total_volume, exchange, source
                     FROM `{self.bq_client.project}.{Config.BQ_DATASET}.{Config.BQ_ADJ_TABLE}`
                     WHERE symbol IN UNNEST(@tickers)
                       AND trading_date >= @start_date
