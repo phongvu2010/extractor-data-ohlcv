@@ -15,7 +15,7 @@ from urllib3.util import Retry
 
 from config import Config
 from notifier import Notifier
-from storages import Storage
+from storages import BaseStorage, get_storage
 from utils import normalize_exchange, setup_logger
 
 
@@ -151,10 +151,10 @@ class DataProcessor:
     """Chuyên trách việc làm sạch, chuẩn hóa và ép kiểu dữ liệu chứng khoán lịch sử từ CSV."""
 
     logger: logging.Logger
-    storage: Optional[Storage]
+    storage: Optional[BaseStorage]
     blacklist: Set[str]
 
-    def __init__(self, logger: logging.Logger, storage: Optional[Storage] = None) -> None:
+    def __init__(self, logger: logging.Logger, storage: Optional[BaseStorage] = None) -> None:
         """Khởi tạo bộ xử lý dữ liệu và tải danh sách đen (Blacklist) loại bỏ các mã không hợp lệ.
 
         Args:
@@ -338,13 +338,13 @@ class CafeFExtractorETL:
     """Bộ điều phối chính (Orchestrator) quản lý toàn bộ vòng đời chạy của CafeF Pipeline."""
 
     logger: logging.Logger
-    storage: Storage
+    storage: BaseStorage
     processor: DataProcessor
 
     def __init__(
         self,
         logger_name: str = Config.DEFAULT_LOGGER_NAME,
-        storage: Optional[Storage] = None,
+        storage: Optional[BaseStorage] = None,
     ) -> None:
         """Khởi tạo đối tượng ETL và cấu hình kết nối các phân lớp.
 
@@ -353,7 +353,7 @@ class CafeFExtractorETL:
             storage: Đối tượng Storage chia sẻ kết nối GCP.
         """
         self.logger = setup_logger(logger_name)
-        self.storage = storage or Storage(self.logger)
+        self.storage = storage or get_storage(Config.DEPLOYMENT_ENV, self.logger)
         self.processor = DataProcessor(self.logger, storage=self.storage)
 
     def run(

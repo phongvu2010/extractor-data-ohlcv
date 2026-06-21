@@ -34,3 +34,7 @@ holidays==0.98
 # Cấu hình, Logging & Tiện ích
 python-dotenv==1.0.1
 rich==15.0.0
+
+# Database & ORM
+SQLAlchemy==2.0.31
+psycopg2==2.9.9

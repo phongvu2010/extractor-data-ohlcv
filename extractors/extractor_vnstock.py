@@ -14,7 +14,7 @@ from vnstock.ui import Market
 
 from config import Config
 from notifier import Notifier
-from storages import Storage
+from storages import BaseStorage, get_storage
 from utils import normalize_exchange, setup_logger, SmartRateLimiter
 
 # Suppress spam logging from vnstock internal company explorer module
@@ -241,7 +241,7 @@ class DataProcessor:
 
     def detect_corporate_actions_via_api(
         self, symbols: List[str], start_date: date, end_date: date
-    ) -> Dict[str, date]:
+    ) -> List[Dict[str, Any]]:
         """Quét và phát hiện lịch sự kiện doanh nghiệp của một nhóm mã chứng khoán thông qua API.
 
         Args:
@@ -250,10 +250,10 @@ class DataProcessor:
             end_date: Mốc thời gian kết thúc quét sự kiện.
 
         Returns:
-            Dict chứa thông tin ánh xạ giữa mã chứng khoán (symbol) và ngày ex_date có hiệu lực sự kiện.
+            Danh sách chứa thông tin chi tiết các sự kiện doanh nghiệp.
         """
         if not symbols:
-            return {}
+            return []
 
         start_str: str = start_date.strftime("%Y%m%d")
         end_str: str = (end_date + timedelta(days=1)).strftime("%Y%m%d")
@@ -301,7 +301,7 @@ class DataProcessor:
                 all_dfs.append(df_batch)
 
         if not all_dfs:
-            return {}
+            return []
 
         df_events: pd.DataFrame = pd.concat(all_dfs, ignore_index=True)
         rename_map: Dict[str, str] = {
@@ -311,11 +311,11 @@ class DataProcessor:
         df_events = df_events.rename(columns=rename_map)
 
         if "exright_date" not in df_events.columns:
-            return {}
+            return []
 
         df_events = df_events[df_events["exright_date"].notna()]
         if df_events.empty:
-            return {}
+            return []
 
         df_events["ex_date"] = pd.to_datetime(df_events["exright_date"]).dt.date
 
@@ -326,12 +326,12 @@ class DataProcessor:
         ]
 
         if df_filtered.empty:
-            return {}
+            return []
 
         # Ưu tiên lấy sự kiện sớm nhất nếu có nhiều sự kiện phát sinh cho một mã
         df_filtered = df_filtered.sort_values(by="ex_date")
 
-        detected_map: Dict[str, date] = {}
+        events: List[Dict[str, Any]] = []
         ticker_pattern: re.Pattern = re.compile(r"^[A-Z0-9]{3,10}$")
 
         for _, row in df_filtered.iterrows():
@@ -341,10 +341,22 @@ class DataProcessor:
 
             ex_date: Any = row["ex_date"]
             if ticker and ticker_pattern.match(ticker) and isinstance(ex_date, date):
-                if ticker not in detected_map:
-                    detected_map[ticker] = ex_date
+                rec_date_val = None
+                if "recordDate" in row and pd.notna(row["recordDate"]):
+                    try:
+                        rec_date_val = pd.to_datetime(row["recordDate"]).date()
+                    except Exception:
+                        pass
+                ratio_val = str(row.get("exerciseRatio", "")) if pd.notna(row.get("exerciseRatio")) else None
+                events.append({
+                    "symbol": ticker,
+                    "event_type": row.get("eventCode", "DIV"),
+                    "ex_date": ex_date,
+                    "record_date": rec_date_val,
+                    "ratio": ratio_val
+                })
 
-        return detected_map
+        return events
 
 
 class VnstockExtractorETL:
@@ -352,7 +364,7 @@ class VnstockExtractorETL:
 
     logger: logging.Logger
     processor: DataProcessor
-    storage: Storage
+    storage: BaseStorage
 
     def __init__(self, logger_name: str = Config.DEFAULT_LOGGER_NAME) -> None:
         """Khởi tạo các phân lớp phục vụ xử lý và lưu trữ dữ liệu.
@@ -362,7 +374,7 @@ class VnstockExtractorETL:
         """
         self.logger = setup_logger(logger_name)
         self.processor = DataProcessor(self.logger)
-        self.storage = Storage(self.logger)
+        self.storage = get_storage(Config.DEPLOYMENT_ENV, self.logger)
 
     def _initialize_run_dates(
         self,
@@ -447,7 +459,9 @@ class VnstockExtractorETL:
         self.logger.info(
             f"🔍 [Corporate Actions T0] Đang quét trực tiếp API sự kiện hôm nay cho {len(symbols)} mã..."
         )
-        return self.processor.detect_corporate_actions_via_api(symbols, today_date, today_date)
+        events = self.processor.detect_corporate_actions_via_api(symbols, today_date, today_date)
+        self.storage.save_corporate_events(events)
+        return {e["symbol"]: e["ex_date"] for e in events}
 
     def _backfill_missing_history(self, missing_dates: List[date]) -> None:
         """Bù lại toàn bộ các ngày giao dịch bị thiếu thông qua extractor CafeF.
@@ -670,6 +684,35 @@ class VnstockExtractorETL:
             DataFrame dữ liệu giao dịch T0 ngày hôm nay nếu thành công, ngược lại trả về None.
         """
         symbols_map: Dict[str, str] = self.processor.get_symbols_with_exchange()
+
+        # Đồng bộ danh sách công ty từ vnstock vào DB (chỉ áp dụng ở môi trường hỗ trợ lưu trữ thông tin công ty)
+        try:
+            self.logger.info("🏢 Bắt đầu cào danh sách công ty từ vnstock...")
+            df_symbols = self.processor.reference_api.equity().list_by_exchange()
+            df_symbols = df_symbols[~df_symbols["type"].isin(["corpbond", "bond", "future"])]
+
+            # Tải danh sách ngành từ vnstock
+            df_industry = self.processor.reference_api.equity().list_by_industry()
+            df_ind_level = df_industry[df_industry["icb_level"] == 4]
+            if df_ind_level.empty:
+                df_ind_level = df_industry[df_industry["icb_level"] == 3]
+            if df_ind_level.empty:
+                df_ind_level = df_industry[df_industry["icb_level"] == 1]
+
+            df_merged = pd.merge(df_symbols, df_ind_level[["symbol", "icb_name"]], on="symbol", how="left")
+            df_companies = pd.DataFrame({
+                "symbol": df_merged["symbol"].str.strip().str.upper(),
+                "exchange": df_merged["exchange"].apply(normalize_exchange),
+                "company_name": df_merged["organ_name"].str.strip().fillna("Unknown"),
+                "industry": df_merged["icb_name"].str.strip().fillna("Unknown"),
+                "status": "active"
+            })
+            df_companies.drop_duplicates(subset=["symbol"], inplace=True)
+            self.storage.save_companies(df_companies)
+            self.logger.info(f"✅ Đã cào và đồng bộ {len(df_companies)} công ty vào database.")
+        except Exception as e:
+            self.logger.error(f"❌ Lỗi khi đồng bộ danh sách công ty: {e}", exc_info=True)
+
         t0_multiplier: float = self.verify_price_units(symbols_map)
         symbols: List[str] = list(symbols_map.keys())
 
@@ -706,9 +749,11 @@ class VnstockExtractorETL:
             try:
                 backfill_start: date = min(missing_dates)
                 backfill_end: date = max(missing_dates)
-                detected_backfill_map: Dict[str, date] = self.processor.detect_corporate_actions_via_api(
+                detected_backfill_events = self.processor.detect_corporate_actions_via_api(
                     symbols, backfill_start, backfill_end
                 )
+                self.storage.save_corporate_events(detected_backfill_events)
+                detected_backfill_map = {e["symbol"]: e["ex_date"] for e in detected_backfill_events}
                 if detected_backfill_map:
                     self.logger.warning(
                         f"🔔 [Backfill] Phát hiện {len(detected_backfill_map)} mã có sự kiện trong thời gian backfill: "

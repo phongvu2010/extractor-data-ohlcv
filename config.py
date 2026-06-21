@@ -141,6 +141,10 @@ class Config:
             cls._cached_year = current_year
         return cls._cached_holidays
 
+    # Môi trường chạy hệ thống (cloud / local)
+    DEPLOYMENT_ENV: str = os.getenv("DEPLOYMENT_ENV", "cloud").strip().lower()
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "")
+
     # Cấu hình Google Cloud Storage (GCS)
     GCS_BUCKET_NAME: str = os.getenv("GCS_BUCKET_NAME", "vn-stock")
     GCS_CHECKPOINT_KEY: str = os.getenv("GCS_CHECKPOINT_KEY", "checkpoints/latest_state.json")
@@ -174,3 +178,36 @@ class Config:
 
     # Cấu hình bỏ qua các chốt chặn ngày nghỉ (cuối tuần / lễ) khi cần chạy ép buộc
     FORCE_RUN: bool = os.getenv("FORCE_RUN", os.getenv("FORCE_RUN_WEEKEND", "false")).lower() == "true"
+
+    @classmethod
+    def validate_config(cls) -> None:
+        """Kiểm tra cấu hình hệ thống và đưa ra các cảnh báo cần thiết."""
+        missing_critical = []
+        if cls.DEPLOYMENT_ENV == "local":
+            if not cls.DATABASE_URL:
+                missing_critical.append("DATABASE_URL")
+        elif cls.DEPLOYMENT_ENV == "cloud":
+            if not cls.GCS_BUCKET_NAME:
+                missing_critical.append("GCS_BUCKET_NAME")
+            if not cls.BQ_DATASET:
+                missing_critical.append("BQ_DATASET")
+
+        if missing_critical:
+            warnings.warn(
+                f"⚠️ [Cấu hình] Thiếu các biến môi trường quan trọng cho chế độ '{cls.DEPLOYMENT_ENV}': {', '.join(missing_critical)}. "
+                "Hệ thống có thể không hoạt động hoặc sập khi thực thi.",
+                RuntimeWarning
+            )
+
+        # Cảnh báo nếu cấu hình Telegram bị thiếu 1 trong 2 trường
+        if (cls.TELEGRAM_BOT_TOKEN and not cls.TELEGRAM_CHAT_ID) or (cls.TELEGRAM_CHAT_ID and not cls.TELEGRAM_BOT_TOKEN):
+            warnings.warn(
+                "⚠️ [Cấu hình] Thiếu TELEGRAM_BOT_TOKEN hoặc TELEGRAM_CHAT_ID. "
+                "Hệ thống sẽ không gửi được thông báo cảnh báo qua Telegram.",
+                UserWarning
+            )
+
+
+# Tự động kiểm tra cấu hình khi import module config
+Config.validate_config()
+
