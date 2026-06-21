@@ -1,12 +1,10 @@
+from datetime import date, datetime
 import gc
-import json
 import logging
 import os
 import time
-from datetime import date, datetime
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any
 
-import numpy as np
 import pandas as pd
 from sqlalchemy import (
     BigInteger,
@@ -111,7 +109,6 @@ class LocalStorage(BaseStorage):
         # Cơ chế tự động thử lại kết nối phục vụ khởi động Docker Compose đồng bộ
         max_retries: int = 5
         retry_delay: int = 3
-        connected: bool = False
 
         self.logger.info("🔌 [LocalStorage] Đang kết nối đến PostgreSQL/TimescaleDB...")
         for attempt in range(1, max_retries + 1):
@@ -120,7 +117,6 @@ class LocalStorage(BaseStorage):
                 # Chạy thử truy vấn để xác thực kết nối
                 with self.engine.connect() as conn:
                     conn.execute(text("SELECT 1"))
-                connected = True
                 self.logger.info("🐘 [LocalStorage] Kết nối thành công đến PostgreSQL.")
                 break
             except Exception as e:
@@ -172,7 +168,7 @@ class LocalStorage(BaseStorage):
             self.logger.error(f"🛑 [LocalStorage] Lỗi khởi tạo database: {e}")
             raise e
 
-    def _create_upsert_method(self, index_elements: List[str]):
+    def _create_upsert_method(self, index_elements: list[str]):
         """Tạo hàm helper cho pandas to_sql thực hiện Upsert (INSERT ... ON CONFLICT DO UPDATE)."""
         from sqlalchemy.dialects.postgresql import insert
 
@@ -202,7 +198,7 @@ class LocalStorage(BaseStorage):
         date_ref: datetime,
         suffix: str = "raw",
         partition: bool = False
-    ) -> Optional[str]:
+    ) -> str | None:
         """Lưu trữ dữ liệu nén Parquet cục bộ và trả về đường dẫn."""
         if df is None or df.empty:
             return None
@@ -288,7 +284,7 @@ class LocalStorage(BaseStorage):
             self.logger.error(f"❌ [Postgres] Lỗi đồng bộ phân vùng vào bảng {table_name}: {e}")
             raise e
 
-    def sync_adjusted_symbols_to_bigquery(self, symbols: List[str]) -> None:
+    def sync_adjusted_symbols_to_bigquery(self, symbols: list[str]) -> None:
         """Đọc và đồng bộ lịch sử điều chỉnh của danh sách mã từ Parquet cục bộ vào PostgreSQL."""
         if not symbols:
             return
@@ -327,14 +323,14 @@ class LocalStorage(BaseStorage):
 
     def sync_daily_adjusted_prices(
         self,
-        dates: List[Union[datetime, date]],
-        excluded_symbols: List[str]
+        dates: list[datetime | date],
+        excluded_symbols: list[str]
     ) -> None:
         """Sao chép giá thô của các ngày sang bảng giá điều chỉnh đối với các mã bình thường."""
         if not dates:
             return
 
-        date_strings: List[str] = [
+        date_strings: list[str] = [
             d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else str(d) for d in dates
         ]
         self.logger.info(f"⚡ [Postgres] Đang sao chép giá từ raw sang adjusted cho các ngày: {date_strings}...")
@@ -378,7 +374,7 @@ class LocalStorage(BaseStorage):
             self.logger.error(f"❌ [Postgres] Lỗi đồng bộ adjusted_price số lượng lớn ngày: {e}")
             raise e
 
-    def read_checkpoint(self) -> Dict[str, Any]:
+    def read_checkpoint(self) -> dict[str, Any]:
         """Đọc tệp checkpoint EOD từ bảng pipeline_state."""
         try:
             with self.Session() as session:
@@ -403,8 +399,8 @@ class LocalStorage(BaseStorage):
     def save_checkpoint(
         self,
         df: pd.DataFrame,
-        active_symbols: Optional[Set[str]] = None,
-        pending_adjusted_reloads: Optional[List[str]] = None
+        active_symbols: set[str] | None = None,
+        pending_adjusted_reloads: list[str] | None = None
     ) -> None:
         """Trích xuất và cập nhật checkpoint trạng thái thị trường EOD vào PostgreSQL."""
         if df is None or df.empty:
@@ -414,7 +410,7 @@ class LocalStorage(BaseStorage):
 
         df_latest: pd.DataFrame = df.drop_duplicates(subset=["symbol"], keep="last").copy()
 
-        price_cols: List[str] = ["open_price", "high_price", "low_price", "close_price"]
+        price_cols: list[str] = ["open_price", "high_price", "low_price", "close_price"]
         if "average_price" not in df_latest.columns:
             df_latest["average_price"] = df_latest[price_cols].mean(axis=1)
 
@@ -438,16 +434,16 @@ class LocalStorage(BaseStorage):
             df_latest["symbol"] = df_latest["symbol"].astype(str)
         df_latest.set_index("symbol", inplace=True)
 
-        cols_to_extract: List[str] = [
+        cols_to_extract: list[str] = [
             "exchange", "trading_date", "open_price", "high_price",
             "low_price", "close_price", "average_price", "total_volume"
         ]
-        current_data_dict: Dict[str, Dict[str, Any]] = df_latest[cols_to_extract].to_dict(orient="index")
+        current_data_dict: dict[str, dict[str, Any]] = df_latest[cols_to_extract].to_dict(orient="index")
 
-        old_checkpoint: Dict[str, Any] = self.read_checkpoint()
-        merged_snapshots: Dict[str, Dict[str, Any]] = old_checkpoint.get("snapshots", {})
-        old_metadata: Dict[str, Any] = old_checkpoint.get("metadata") or {}
-        old_pending: List[str] = old_metadata.get("pending_adjusted_reloads") or []
+        old_checkpoint: dict[str, Any] = self.read_checkpoint()
+        merged_snapshots: dict[str, dict[str, Any]] = old_checkpoint.get("snapshots", {})
+        old_metadata: dict[str, Any] = old_checkpoint.get("metadata") or {}
+        old_pending: list[str] = old_metadata.get("pending_adjusted_reloads") or []
 
         if pending_adjusted_reloads is None:
             pending_adjusted_reloads = old_pending
@@ -456,7 +452,7 @@ class LocalStorage(BaseStorage):
             for sym, new_row in current_data_dict.items():
                 if not sym:
                     continue
-                old_row: Optional[Dict[str, Any]] = merged_snapshots.get(sym)
+                old_row: dict[str, Any] | None = merged_snapshots.get(sym)
                 if not old_row or new_row["trading_date"] >= old_row["trading_date"]:
                     merged_snapshots[sym] = new_row
         else:
@@ -471,13 +467,13 @@ class LocalStorage(BaseStorage):
             if "average_price" in row and isinstance(row["average_price"], (int, float)):
                 row["average_price"] = round(float(row["average_price"]), 1)
 
-        final_snapshots: Dict[str, Dict[str, Any]] = {}
+        final_snapshots: dict[str, dict[str, Any]] = {}
         for sym in sorted(merged_snapshots.keys()):
             if active_symbols and sym not in active_symbols:
                 continue
             final_snapshots[sym] = merged_snapshots[sym]
 
-        final_json_structure: Dict[str, Any] = {
+        final_json_structure: dict[str, Any] = {
             "metadata": {
                 "last_successful_run": max_date_str,
                 "is_eod": is_eod,
@@ -496,7 +492,6 @@ class LocalStorage(BaseStorage):
                     meta_row = PipelineStateModel(key="metadata", value=final_json_structure["metadata"])
                     session.add(meta_row)
                 else:
-                    # Gán lại trị giá dict (SQLAlchemy tự phát hiện đổi thay nếu dùng session.commit)
                     meta_row.value = final_json_structure["metadata"]
 
                 # Cập nhật hoặc tạo mới key snapshots
@@ -517,11 +512,11 @@ class LocalStorage(BaseStorage):
             del current_data_dict, merged_snapshots, final_snapshots
             gc.collect()
 
-    def read_blacklist(self) -> Set[str]:
+    def read_blacklist(self) -> set[str]:
         """Tải danh sách mã thuộc danh sách đen từ file blacklist.txt cục bộ."""
         try:
             with open("blacklist.txt", "r", encoding="utf-8") as file:
-                blacklist: Set[str] = {
+                blacklist: set[str] = {
                     line.strip().upper()
                     for line in file
                     if line.strip() and not line.strip().startswith("#")
@@ -532,7 +527,7 @@ class LocalStorage(BaseStorage):
             self.logger.warning("⚠️ [LocalStorage] Không tìm thấy file 'blacklist.txt' cục bộ. Bỏ qua bộ lọc blacklist.")
             return set()
 
-    def save_corporate_events(self, events: List[Dict[str, Any]]) -> None:
+    def save_corporate_events(self, events: list[dict[str, Any]]) -> None:
         """Lưu danh sách chi tiết sự kiện doanh nghiệp vào PostgreSQL."""
         if not events:
             return

@@ -1,8 +1,8 @@
 from datetime import datetime
 import html
 import logging
-from typing import Any, Dict, List, Optional, Union
 import time
+from typing import Any
 
 import requests
 
@@ -13,7 +13,7 @@ from utils import setup_logger
 class Notifier:
     """Quản lý việc gửi tin nhắn cảnh báo và báo cáo kết quả chạy qua Telegram."""
 
-    def __init__(self, logger: Optional[logging.Logger] = None) -> None:
+    def __init__(self, logger: logging.Logger | None = None) -> None:
         """Khởi tạo đối tượng Notifier.
 
         Args:
@@ -39,7 +39,7 @@ class Notifier:
             return
 
         url: str = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
-        payload: Dict[str, Any] = {
+        payload: dict[str, Any] = {
             "chat_id": self.telegram_chat_id,
             "text": text,
             "parse_mode": "HTML",
@@ -96,10 +96,10 @@ class Notifier:
         date_str: str,
         total_processed: int,
         is_eod: bool,
-        missing_dates: List[Any],
-        reloaded_symbols: List[str],
-        failed_reloads: List[str],
-        export_summary: Optional[Dict[str, Any]] = None,
+        missing_dates: list[Any],
+        reloaded_symbols: list[str],
+        failed_reloads: list[str],
+        export_summary: dict[str, Any] | None = None,
     ) -> None:
         """Gửi báo cáo tổng hợp chi tiết sau khi kết thúc phiên chạy hàng ngày thành công.
 
@@ -112,7 +112,7 @@ class Notifier:
             failed_reloads: Danh sách các mã gặp sự cố khi tải lại lịch sử giá điều chỉnh.
             export_summary: Thông số tóm tắt tiến trình xuất dữ liệu các mã quan tâm lên GCS.
         """
-        def _format_symbols(symbols: List[str], max_show: int = 15) -> str:
+        def _format_symbols(symbols: list[str], max_show: int = 15) -> str:
             if not symbols:
                 return "Không có"
             if len(symbols) <= max_show:

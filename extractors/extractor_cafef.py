@@ -4,10 +4,11 @@ import gc
 import io
 import logging
 import random
-from typing import Any, Dict, Iterator, List, Optional, Set
 import time
+from typing import Any, Iterator
 import zipfile
 
+import numpy as np
 import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
@@ -68,7 +69,7 @@ class Downloader:
             self.session.close()
             self.logger.info("🔌 [Downloader] Đã đóng tài nguyên kết nối mạng an toàn sau khi sử dụng.")
 
-    def download_zip_stream(self, date_ref: datetime, is_raw: bool) -> Optional[io.BytesIO]:
+    def download_zip_stream(self, date_ref: datetime, is_raw: bool) -> io.BytesIO | None:
         """Tải tệp zip chứa dữ liệu lịch sử từ CafeF về bộ nhớ đệm RAM.
 
         Args:
@@ -151,10 +152,10 @@ class DataProcessor:
     """Chuyên trách việc làm sạch, chuẩn hóa và ép kiểu dữ liệu chứng khoán lịch sử từ CSV."""
 
     logger: logging.Logger
-    storage: Optional[BaseStorage]
-    blacklist: Set[str]
+    storage: BaseStorage | None
+    blacklist: set[str]
 
-    def __init__(self, logger: logging.Logger, storage: Optional[BaseStorage] = None) -> None:
+    def __init__(self, logger: logging.Logger, storage: BaseStorage | None = None) -> None:
         """Khởi tạo bộ xử lý dữ liệu và tải danh sách đen (Blacklist) loại bỏ các mã không hợp lệ.
 
         Args:
@@ -165,7 +166,7 @@ class DataProcessor:
         self.storage = storage
         self.blacklist = self._load_blacklist()
 
-    def _load_blacklist(self) -> Set[str]:
+    def _load_blacklist(self) -> set[str]:
         """Tải tập hợp danh sách các mã rác, mã ảo cần loại bỏ.
 
         Returns:
@@ -190,7 +191,7 @@ class DataProcessor:
             self.logger.warning("⚠️ [CafeF] Không tìm thấy file 'blacklist.txt' cục bộ. Bỏ qua bộ lọc danh sách đen.")
             return set()
 
-    def _get_column_names(self, include_exchange: bool = True, include_source: bool = False) -> List[str]:
+    def _get_column_names(self, include_exchange: bool = True, include_source: bool = False) -> list[str]:
         """Lấy danh sách tên các cột dữ liệu theo thứ tự chuẩn.
 
         Args:
@@ -200,7 +201,7 @@ class DataProcessor:
         Returns:
             Danh sách tên cột.
         """
-        cols: List[str] = [
+        cols: list[str] = [
             "symbol", "trading_date", "open_price", "high_price", "low_price", "close_price", "total_volume"
         ]
         if include_exchange:
@@ -236,8 +237,12 @@ class DataProcessor:
         )
         chunk["source"] = "cafef"
 
+        # Loại bỏ các giá trị vô cực (inf) hoặc NaN trước khi nhân để tránh lỗi tràn số (overflow)
+        price_cols: list[str] = ["open_price", "high_price", "low_price", "close_price"]
+        chunk[price_cols] = chunk[price_cols].replace([np.inf, -np.inf], np.nan)
+        chunk = chunk.dropna(subset=price_cols)
+
         # Nhân giá thô với hệ số quy đổi (thường là 1000) để khớp đơn vị
-        price_cols: List[str] = ["open_price", "high_price", "low_price", "close_price"]
         chunk[price_cols] *= Config.PRICE_MULTIPLIER
 
         # Ép kiểu dữ liệu dung lượng nhỏ để tối ưu hóa bộ nhớ RAM
@@ -265,10 +270,10 @@ class DataProcessor:
         Returns:
             DataFrame hoàn chỉnh đã chuẩn hóa toàn bộ dữ liệu.
         """
-        cols_order: List[str] = self._get_column_names(include_exchange=False, include_source=False)
-        final_cols_order: List[str] = self._get_column_names(include_exchange=True, include_source=True)
+        cols_order: list[str] = self._get_column_names(include_exchange=False, include_source=False)
+        final_cols_order: list[str] = self._get_column_names(include_exchange=True, include_source=True)
 
-        csv_dtypes: Dict[str, str] = {
+        csv_dtypes: dict[str, str] = {
             "symbol": "str",
             "open_price": "float32",
             "high_price": "float32",
@@ -277,9 +282,9 @@ class DataProcessor:
             "total_volume": "float32",
         }
 
-        dfs: List[pd.DataFrame] = []
+        dfs: list[pd.DataFrame] = []
         with zipfile.ZipFile(zip_data) as z:
-            csv_files: List[str] = [name for name in z.namelist() if name.endswith(".csv")]
+            csv_files: list[str] = [name for name in z.namelist() if name.endswith(".csv")]
             if not csv_files:
                 self.logger.warning("📭 Tệp Zip trống hoặc không chứa file '.csv' nào.")
                 return pd.DataFrame(columns=final_cols_order)
@@ -344,7 +349,7 @@ class CafeFExtractorETL:
     def __init__(
         self,
         logger_name: str = Config.DEFAULT_LOGGER_NAME,
-        storage: Optional[BaseStorage] = None,
+        storage: BaseStorage | None = None,
     ) -> None:
         """Khởi tạo đối tượng ETL và cấu hình kết nối các phân lớp.
 
@@ -362,7 +367,7 @@ class CafeFExtractorETL:
         is_raw: bool = True,
         partition: bool = False,
         save_checkpoint: bool = True,
-    ) -> Optional[pd.DataFrame]:
+    ) -> pd.DataFrame | None:
         """Thực thi quy trình ETL tải, xử lý làm sạch và nạp dữ liệu CafeF.
 
         Args:
@@ -412,7 +417,7 @@ class CafeFExtractorETL:
 
                     self.logger.info(f"✅ Tải và làm sạch dữ liệu thành công! Kích thước: {df.shape}")
 
-                    gcs_path: Optional[str] = self.storage.save_parquet(df, date_ref, suffix, partition=partition)
+                    gcs_path: str | None = self.storage.save_parquet(df, date_ref, suffix, partition=partition)
 
                     # Nạp trực tiếp dữ liệu từ file GCS lên BigQuery
                     if gcs_path:

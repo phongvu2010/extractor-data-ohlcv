@@ -1,8 +1,10 @@
 from abc import ABC, abstractmethod
+from datetime import date, datetime
 import logging
+from typing import Any
+
 import pandas as pd
-from datetime import datetime, date
-from typing import Any, Dict, List, Optional, Set, Union
+
 
 class BaseStorage(ABC):
     """Abstract Base Class định nghĩa giao diện chung cho các cơ chế lưu trữ dữ liệu."""
@@ -24,7 +26,7 @@ class BaseStorage(ABC):
         date_ref: datetime,
         suffix: str = "raw",
         partition: bool = False
-    ) -> Optional[str]:
+    ) -> str | None:
         """Lưu trữ DataFrame dưới dạng tệp nén Parquet.
 
         Args:
@@ -71,7 +73,7 @@ class BaseStorage(ABC):
         pass
 
     @abstractmethod
-    def sync_adjusted_symbols_to_bigquery(self, symbols: List[str]) -> None:
+    def sync_adjusted_symbols_to_bigquery(self, symbols: list[str]) -> None:
         """Đồng bộ lịch sử điều chỉnh của danh sách mã chứng khoán vào database.
 
         Args:
@@ -82,8 +84,8 @@ class BaseStorage(ABC):
     @abstractmethod
     def sync_daily_adjusted_prices(
         self,
-        dates: List[Union[datetime, date]],
-        excluded_symbols: List[str]
+        dates: list[datetime | date],
+        excluded_symbols: list[str]
     ) -> None:
         """Đồng bộ hóa dữ liệu giá từ raw sang adjusted cho danh sách các ngày.
 
@@ -97,8 +99,8 @@ class BaseStorage(ABC):
     def save_checkpoint(
         self,
         df: pd.DataFrame,
-        active_symbols: Optional[Set[str]] = None,
-        pending_adjusted_reloads: Optional[List[str]] = None
+        active_symbols: set[str] | None = None,
+        pending_adjusted_reloads: list[str] | None = None
     ) -> None:
         """Trích xuất và cập nhật checkpoint trạng thái thị trường EOD.
 
@@ -110,7 +112,7 @@ class BaseStorage(ABC):
         pass
 
     @abstractmethod
-    def read_checkpoint(self) -> Dict[str, Any]:
+    def read_checkpoint(self) -> dict[str, Any]:
         """Đọc checkpoint snapshot thị trường đã lưu trữ gần nhất.
 
         Returns:
@@ -119,7 +121,7 @@ class BaseStorage(ABC):
         pass
 
     @abstractmethod
-    def read_blacklist(self) -> Set[str]:
+    def read_blacklist(self) -> set[str]:
         """Tải danh sách các mã chứng khoán thuộc danh sách đen.
 
         Returns:
@@ -128,7 +130,7 @@ class BaseStorage(ABC):
         pass
 
     @abstractmethod
-    def save_corporate_events(self, events: List[Dict[str, Any]]) -> None:
+    def save_corporate_events(self, events: list[dict[str, Any]]) -> None:
         """Lưu danh sách chi tiết sự kiện doanh nghiệp.
 
         Args:
@@ -145,7 +147,7 @@ class BaseStorage(ABC):
         """
         pass
 
-    def export_interested_tickers_data(self) -> Optional[Dict[str, Any]]:
+    def export_interested_tickers_data(self) -> dict[str, Any] | None:
         """Trích xuất dữ liệu các mã cổ phiếu quan tâm. (Chỉ áp dụng cho CloudStorage)
 
         Returns:

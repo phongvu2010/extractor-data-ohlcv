@@ -2,8 +2,8 @@ from datetime import datetime, timezone
 import json
 import logging
 import os
-from typing import Any, Callable, Dict, Optional
 import time
+from typing import Any, Callable
 
 from rich.console import Console
 from rich.logging import RichHandler
@@ -53,7 +53,7 @@ class GCPJSONFormatter(logging.Formatter):
         # Phân loại cấp độ log cho GCP
         severity: str = record.levelname
 
-        log_payload: Dict[str, Any] = {
+        log_payload: dict[str, Any] = {
             "severity": severity,
             "message": message,
             "logger.name": record.name,
@@ -196,7 +196,7 @@ class SmartRateLimiter:
         """
         return self.count >= self.limit
 
-    def wait_if_needed(self, io_task: Optional[Callable[[], None]] = None) -> None:
+    def wait_if_needed(self, io_task: Callable[[], None] | None = None) -> None:
         """Thực hiện dừng luồng để làm mát API, có thể kết hợp chạy tác vụ phụ song song.
 
         Args:

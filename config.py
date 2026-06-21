@@ -1,7 +1,6 @@
+from datetime import date, datetime
 import os
 import warnings
-from datetime import date, datetime
-from typing import List, Optional, Union
 
 from dotenv import load_dotenv
 import holidays
@@ -23,7 +22,7 @@ def _get_env_int(key: str, default: int) -> int:
     """
     if not isinstance(default, int) or isinstance(default, bool):
         raise TypeError(f"Default value for {key} must be an int, got {type(default).__name__}")
-    val: Optional[str] = os.getenv(key)
+    val: str | None = os.getenv(key)
     if val is None:
         return default
     val = val.strip()
@@ -52,7 +51,7 @@ def _get_env_float(key: str, default: float) -> float:
     """
     if not isinstance(default, (int, float)) or isinstance(default, bool):
         raise TypeError(f"Default value for {key} must be a float or int, got {type(default).__name__}")
-    val: Optional[str] = os.getenv(key)
+    val: str | None = os.getenv(key)
     if val is None:
         return float(default)
     val = val.strip()
@@ -96,11 +95,11 @@ class Config:
     # Thiết lập múi giờ Việt Nam để đồng bộ thời gian giao dịch sàn nội địa
     VN_TZ: pytz.tzinfo.BaseTzInfo = pytz.timezone("Asia/Ho_Chi_Minh")
 
-    _cached_year: Optional[int] = None
-    _cached_holidays: Optional[List[str]] = None
+    _cached_year: int | None = None
+    _cached_holidays: list[str] | None = None
 
     @classmethod
-    def get_vn_holiday_dates(cls) -> List[str]:
+    def get_vn_holiday_dates(cls) -> list[str]:
         """Lấy danh sách các ngày nghỉ lễ của Việt Nam.
 
         Kết hợp ngày lễ quốc gia và cấu hình thủ công qua CUSTOM_HOLIDAYS,
@@ -118,7 +117,7 @@ class Config:
 
             # Danh sách ngày nghỉ lễ bổ sung được cấu hình thủ công qua biến môi trường (dạng YYYY-MM-DD, cách nhau bởi dấu phẩy)
             custom_holidays_raw: str = os.getenv("CUSTOM_HOLIDAYS", "")
-            custom_holiday_list: List[str] = []
+            custom_holiday_list: list[str] = []
             for d in custom_holidays_raw.split(","):
                 d_clean: str = d.strip()
                 if not d_clean:
@@ -182,7 +181,7 @@ class Config:
     @classmethod
     def validate_config(cls) -> None:
         """Kiểm tra cấu hình hệ thống và đưa ra các cảnh báo cần thiết."""
-        missing_critical = []
+        missing_critical: list[str] = []
         if cls.DEPLOYMENT_ENV == "local":
             if not cls.DATABASE_URL:
                 missing_critical.append("DATABASE_URL")
@@ -210,4 +209,3 @@ class Config:
 
 # Tự động kiểm tra cấu hình khi import module config
 Config.validate_config()
-

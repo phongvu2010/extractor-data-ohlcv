@@ -4,7 +4,7 @@ import io
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any
 import uuid
 
 from google.cloud import bigquery, storage
@@ -59,11 +59,11 @@ class CloudStorage(BaseStorage):
         super().__init__(logger)
         try:
             self.client = storage.Client.from_service_account_json(
-                "secrets/credentials.json"
+                "../secrets/credentials.json"
             )
             # self.client = storage.Client()
             self.bq_client = bigquery.Client.from_service_account_json(
-                "secrets/credentials.json"
+                "../secrets/credentials.json"
             )
             # self.bq_client = bigquery.Client()
             self.bucket = self.client.bucket(Config.GCS_BUCKET_NAME)
@@ -90,7 +90,7 @@ class CloudStorage(BaseStorage):
 
         try:
             tables: bigquery.table.TableIterator = self.bq_client.list_tables(dataset_ref)
-            stale_tables: List[str] = []
+            stale_tables: list[str] = []
             for table in tables:
                 if table.table_id.startswith(prefix):
                     stale_tables.append(table.table_id)
@@ -133,7 +133,7 @@ class CloudStorage(BaseStorage):
         if "trading_date" in df_write.columns:
             df_write["trading_date"] = pd.to_datetime(df_write["trading_date"]).dt.date
 
-        price_cols: List[str] = ["open_price", "high_price", "low_price", "close_price"]
+        price_cols: list[str] = ["open_price", "high_price", "low_price", "close_price"]
         if suffix == "raw":
             df_write[price_cols] = df_write[price_cols].round(0).astype("Int64")
         else:
@@ -175,7 +175,7 @@ class CloudStorage(BaseStorage):
         date_ref: datetime,
         suffix: str = "raw",
         partition: bool = False
-    ) -> Optional[str]:
+    ) -> str | None:
         """Ghi dữ liệu nén Parquet trực tiếp lên Google Cloud Storage (GCS).
 
         Args:
@@ -282,7 +282,7 @@ class CloudStorage(BaseStorage):
             self.logger.info(f"✨ [BigQuery] Đang tạo bảng mới {table_name} với Monthly Partitioning & Clustering...")
             # Xác định kiểu dữ liệu giá là INTEGER cho bảng raw và NUMERIC cho các bảng khác (tránh lỗi lệch kiểu khi tạo mới)
             price_type: str = "INTEGER" if table_name == Config.BQ_RAW_TABLE else "NUMERIC"
-            schema: List[bigquery.SchemaField] = [
+            schema: list[bigquery.SchemaField] = [
                 bigquery.SchemaField("symbol", "STRING"),
                 bigquery.SchemaField("trading_date", "DATE"),
                 bigquery.SchemaField("open_price", price_type),
@@ -302,7 +302,7 @@ class CloudStorage(BaseStorage):
             table.clustering_fields = ["symbol", "exchange"]
             self.bq_client.create_table(table)
 
-    def sync_adjusted_symbol_to_bigquery(self, symbol: str, min_date: Optional[date] = None) -> None:
+    def sync_adjusted_symbol_to_bigquery(self, symbol: str, min_date: date | None = None) -> None:
         """Đồng bộ lịch sử điều chỉnh của một mã chứng khoán duy nhất lên BigQuery qua Staging Table.
 
         Sử dụng cơ chế Staging Table để đảm bảo tính an toàn dữ liệu (nếu nạp file từ GCS lỗi
@@ -354,7 +354,7 @@ class CloudStorage(BaseStorage):
                 min_date_query: str = f"SELECT MIN(trading_date) as min_date FROM `{staging_table_ref}`"
                 min_date_job: bigquery.QueryJob = self.bq_client.query(min_date_query)
                 min_date_result: bigquery.table.RowIterator = min_date_job.result()
-                min_date_rows: List[bigquery.Row] = list(min_date_result)
+                min_date_rows: list[bigquery.Row] = list(min_date_result)
                 min_date = (
                     min_date_rows[0].min_date
                     if min_date_rows and min_date_rows[0].min_date
@@ -406,7 +406,7 @@ class CloudStorage(BaseStorage):
             except Exception as clean_err:
                 self.logger.warning(f"⚠️ [BigQuery] Không thể xóa bảng tạm {staging_table_name}: {clean_err}")
 
-    def sync_adjusted_symbols_to_bigquery(self, symbols: List[str]) -> None:
+    def sync_adjusted_symbols_to_bigquery(self, symbols: list[str]) -> None:
         """Đồng bộ lịch sử điều chỉnh của danh sách các mã chứng khoán lên BigQuery qua một Staging Table duy nhất.
 
         Sử dụng cơ chế Staging Table gộp để giảm thiểu chi phí DDL (tạo/xóa bảng tạm)
@@ -421,8 +421,8 @@ class CloudStorage(BaseStorage):
         if not symbols:
             return
 
-        symbols_upper: List[str] = [s.upper() for s in symbols]
-        gcs_uris: List[str] = [
+        symbols_upper: list[str] = [s.upper() for s in symbols]
+        gcs_uris: list[str] = [
             f"gs://{Config.GCS_BUCKET_NAME}/{Config.GCS_PARQUET_PREFIX}/adj/reloaded/{sym}.parquet"
             for sym in symbols_upper
         ]
@@ -460,7 +460,7 @@ class CloudStorage(BaseStorage):
             min_date_query: str = f"SELECT MIN(trading_date) as min_date FROM `{staging_table_ref}`"
             min_date_job: bigquery.QueryJob = self.bq_client.query(min_date_query)
             min_date_result: bigquery.table.RowIterator = min_date_job.result()
-            min_date_rows: List[bigquery.Row] = list(min_date_result)
+            min_date_rows: list[bigquery.Row] = list(min_date_result)
             min_date = (
                 min_date_rows[0].min_date
                 if min_date_rows and min_date_rows[0].min_date
@@ -639,8 +639,8 @@ class CloudStorage(BaseStorage):
 
     def sync_daily_adjusted_prices(
         self,
-        dates: List[Union[datetime, date]],
-        excluded_symbols: List[str]
+        dates: list[datetime | date],
+        excluded_symbols: list[str]
     ) -> None:
         """Đồng bộ hóa hàng loạt dữ liệu từ raw_price sang adjusted_price cho danh sách các ngày.
 
@@ -657,7 +657,7 @@ class CloudStorage(BaseStorage):
         if not dates:
             return
 
-        date_strings: List[str] = [
+        date_strings: list[str] = [
             d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else str(d) for d in dates
         ]
 
@@ -668,7 +668,7 @@ class CloudStorage(BaseStorage):
         self._ensure_table_exists(Config.BQ_ADJ_TABLE)
         self.logger.info(f"⚡ [BigQuery] Đang sao chép giá từ raw sang adjusted cho các ngày: {date_strings}...")
 
-        query_params: List[Any] = [
+        query_params: list[Any] = [
             bigquery.ArrayQueryParameter("dates", "DATE", date_strings),
         ]
 
@@ -714,7 +714,7 @@ class CloudStorage(BaseStorage):
             self.logger.error(f"❌ [BigQuery] Lỗi đồng bộ adjusted_price số lượng lớn ngày: {e}")
             raise e
 
-    def delete_by_date(self, table_name: str, date_ref: Union[datetime, date, str]) -> None:
+    def delete_by_date(self, table_name: str, date_ref: datetime | date | str) -> None:
         """Xóa toàn bộ bản ghi của một ngày cụ thể trong bảng BigQuery.
 
         Giúp đảm bảo tính idempotent của pipeline (chạy lại nhiều lần không sinh bản ghi thừa).
@@ -746,7 +746,7 @@ class CloudStorage(BaseStorage):
             self.logger.error(f"❌ [BigQuery] Lỗi khi dọn dẹp dữ liệu ngày {date_str}: {e}")
             raise e
 
-    def read_checkpoint(self) -> Dict[str, Any]:
+    def read_checkpoint(self) -> dict[str, Any]:
         """Đọc tệp snapshot thị trường EOD được lưu trữ trước đó trên GCS.
 
         Returns:
@@ -757,7 +757,7 @@ class CloudStorage(BaseStorage):
             blob: storage.Blob = self.bucket.blob(Config.GCS_CHECKPOINT_KEY)
             if blob.exists():
                 json_str: str = blob.download_as_text(encoding="utf-8")
-                result: Dict[str, Any] = json.loads(json_str)
+                result: dict[str, Any] = json.loads(json_str)
                 return result
         except Exception as e:
             self.logger.warning(
@@ -769,8 +769,8 @@ class CloudStorage(BaseStorage):
     def save_checkpoint(
         self,
         df: pd.DataFrame,
-        active_symbols: Optional[Set[str]] = None,
-        pending_adjusted_reloads: Optional[List[str]] = None
+        active_symbols: set[str] | None = None,
+        pending_adjusted_reloads: list[str] | None = None
     ) -> None:
         """Trích xuất và cập nhật trạng thái thị trường EOD (Snapshot) trực tiếp lên GCS.
 
@@ -788,7 +788,7 @@ class CloudStorage(BaseStorage):
         df_latest: pd.DataFrame = df.drop_duplicates(subset=["symbol"], keep="last").copy()
 
         # Tính toán giá trung bình nhanh chóng bằng toán tử cột
-        price_cols: List[str] = ["open_price", "high_price", "low_price", "close_price"]
+        price_cols: list[str] = ["open_price", "high_price", "low_price", "close_price"]
         if "average_price" not in df_latest.columns:
             df_latest["average_price"] = df_latest[price_cols].mean(axis=1)
 
@@ -819,17 +819,17 @@ class CloudStorage(BaseStorage):
         df_latest.set_index("symbol", inplace=True)
 
         # Chỉ lấy các cột cần thiết, ép kiểu chuẩn về dict nguyên bản của Python để gom JSON
-        cols_to_extract: List[str] = [
+        cols_to_extract: list[str] = [
             "exchange", "trading_date", "open_price", "high_price",
             "low_price", "close_price", "average_price", "total_volume"
         ]
-        current_data_dict: Dict[str, Dict[str, Any]] = df_latest[cols_to_extract].to_dict(orient="index")
+        current_data_dict: dict[str, dict[str, Any]] = df_latest[cols_to_extract].to_dict(orient="index")
 
         # 2. Đọc dữ liệu lịch sử cũ từ file checkpoint trên GCS
-        old_checkpoint: Dict[str, Any] = self.read_checkpoint()
-        merged_snapshots: Dict[str, Dict[str, Any]] = old_checkpoint.get("snapshots", {})
-        old_metadata: Dict[str, Any] = old_checkpoint.get("metadata") or {}
-        old_pending: List[str] = old_metadata.get("pending_adjusted_reloads") or []
+        old_checkpoint: dict[str, Any] = self.read_checkpoint()
+        merged_snapshots: dict[str, dict[str, Any]] = old_checkpoint.get("snapshots", {})
+        old_metadata: dict[str, Any] = old_checkpoint.get("metadata") or {}
+        old_pending: list[str] = old_metadata.get("pending_adjusted_reloads") or []
 
         # Hợp nhất pending_adjusted_reloads cũ nếu không được truyền vào mới
         if pending_adjusted_reloads is None:
@@ -840,7 +840,7 @@ class CloudStorage(BaseStorage):
             for sym, new_row in current_data_dict.items():
                 if not sym:
                     continue
-                old_row: Optional[Dict[str, Any]] = merged_snapshots.get(sym)
+                old_row: dict[str, Any] | None = merged_snapshots.get(sym)
                 # Nếu mã chưa có hoặc có ngày mới hơn/bằng ngày cũ -> Cập nhật thông tin mới nhất
                 if not old_row or new_row["trading_date"] >= old_row["trading_date"]:
                     merged_snapshots[sym] = new_row
@@ -859,14 +859,14 @@ class CloudStorage(BaseStorage):
                 row["average_price"] = round(float(row["average_price"]), 1)
 
         # 4. Áp dụng bộ lọc active_symbols & Sắp xếp Alphabet gọn gàng
-        final_snapshots: Dict[str, Dict[str, Any]] = {}
+        final_snapshots: dict[str, dict[str, Any]] = {}
         for sym in sorted(merged_snapshots.keys()):
             if active_symbols and sym not in active_symbols:
                 continue
             final_snapshots[sym] = merged_snapshots[sym]
 
         # 5. Cấu trúc JSON cuối cùng
-        final_json_structure: Dict[str, Any] = {
+        final_json_structure: dict[str, Any] = {
             "metadata": {
                 "last_successful_run": max_date_str,
                 "is_eod": is_eod,
@@ -892,7 +892,7 @@ class CloudStorage(BaseStorage):
             del current_data_dict, merged_snapshots, final_snapshots
             gc.collect()
 
-    def read_blacklist(self) -> Set[str]:
+    def read_blacklist(self) -> set[str]:
         """Đọc tệp danh sách đen (blacklist.txt) từ GCS, nếu không có hoặc lỗi thì fallback về file cục bộ.
 
         Returns:
@@ -904,7 +904,7 @@ class CloudStorage(BaseStorage):
         if blob.exists():
             try:
                 content: str = blob.download_as_text(encoding="utf-8")
-                blacklist: Set[str] = set()
+                blacklist: set[str] = set()
                 for line in content.splitlines():
                     line = line.strip().upper()
                     if line and not line.startswith("#"):
@@ -920,7 +920,7 @@ class CloudStorage(BaseStorage):
         # Fallback đọc từ file cục bộ
         try:
             with open("blacklist.txt", "r", encoding="utf-8") as file:
-                blacklist: Set[str] = {
+                blacklist: set[str] = {
                     line.strip().upper()
                     for line in file
                     if line.strip() and not line.strip().startswith("#")
@@ -931,7 +931,7 @@ class CloudStorage(BaseStorage):
             self.logger.warning("⚠️ [Local] Không tìm thấy file 'blacklist.txt' cục bộ. Bỏ qua bộ lọc danh sách đen.")
             return set()
 
-    def export_interested_tickers_data(self) -> Optional[Dict[str, Any]]:
+    def export_interested_tickers_data(self) -> dict[str, Any] | None:
         """Trích xuất dữ liệu giá thô và giá điều chỉnh theo số năm cấu hình cho các mã cổ phiếu quan tâm.
 
         Danh sách các mã cổ phiếu được lấy từ file text (.txt) lưu trên GCS.
@@ -953,16 +953,16 @@ class CloudStorage(BaseStorage):
             return None
 
         content: str = blob.download_as_text(encoding="utf-8")
-        tickers: List[str] = []
+        tickers: list[str] = []
         ticker_pattern: re.Pattern = re.compile(r"^[A-Z0-9]{3,10}$")
         for line in content.splitlines():
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
             # Cho phép các định dạng phân cách bằng khoảng trắng hoặc dấu phẩy
-            parts: List[str] = [p.strip().upper() for p in line.replace(",", " ").split() if p.strip()]
-            valid_parts: List[str] = [p for p in parts if ticker_pattern.match(p)]
-            invalid_parts: List[str] = [p for p in parts if not ticker_pattern.match(p)]
+            parts: list[str] = [p.strip().upper() for p in line.replace(",", " ").split() if p.strip()]
+            valid_parts: list[str] = [p for p in parts if ticker_pattern.match(p)]
+            invalid_parts: list[str] = [p for p in parts if not ticker_pattern.match(p)]
             if invalid_parts:
                 self.logger.warning(
                     f"⚠️ [Export] Phát hiện mã không hợp lệ bị loại bỏ khỏi danh sách xuất: {invalid_parts}"
@@ -991,8 +991,8 @@ class CloudStorage(BaseStorage):
             export_prefix: str = Config.GCS_EXPORT_PREFIX
             raw_count: int = 0
             adj_count: int = 0
-            exported_raw_tickers: Set[str] = set()
-            exported_adj_tickers: Set[str] = set()
+            exported_raw_tickers: set[str] = set()
+            exported_adj_tickers: set[str] = set()
 
             # Chia nhỏ danh sách mã để truy vấn theo từng nhóm (mỗi nhóm tối đa 150 mã) để tối ưu hóa hiệu năng BigQuery
             batch_size: int = 150
@@ -1000,7 +1000,7 @@ class CloudStorage(BaseStorage):
             # Bước 1: Trích xuất dữ liệu Giá Thô (Raw)
             self.logger.info("📥 [Batch Export] Đang truy vấn và ghi dữ liệu Giá Thô theo nhóm...")
             for i in range(0, len(tickers), batch_size):
-                batch_tickers: List[str] = tickers[i : i + batch_size]
+                batch_tickers: list[str] = tickers[i : i + batch_size]
                 self.logger.info(f"   ↳ Đang xử lý nhóm Giá Thô {i // batch_size + 1}: {len(batch_tickers)} mã...")
                 raw_query: str = f"""
                     SELECT symbol, trading_date, open_price, high_price, low_price, close_price, total_volume, exchange, source
@@ -1089,7 +1089,7 @@ class CloudStorage(BaseStorage):
             self.logger.error(f"❌ Lỗi trong quá trình truy vấn hoặc ghi dữ liệu xuất lên GCS: {e}", exc_info=True)
             raise e
 
-    def save_corporate_events(self, events: List[Dict[str, Any]]) -> None:
+    def save_corporate_events(self, events: list[dict[str, Any]]) -> None:
         """Ghi nhận sự kiện doanh nghiệp (Không thực hiện ở phiên bản CloudStorage)."""
         pass
 
