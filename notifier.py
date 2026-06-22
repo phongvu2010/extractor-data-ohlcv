@@ -1,3 +1,5 @@
+"""Module hỗ trợ gửi tin nhắn thông báo, báo cáo và cảnh báo qua Telegram."""
+
 from datetime import datetime
 import html
 import logging
@@ -17,7 +19,8 @@ class Notifier:
         """Khởi tạo đối tượng Notifier.
 
         Args:
-            logger: Đối tượng Logger dùng để ghi nhận tiến trình. Nếu None, hệ thống tự tạo mới.
+            logger (logging.Logger | None): Đối tượng Logger dùng để ghi nhận
+                tiến trình. Nếu None, hệ thống tự tạo mới.
         """
         self.logger: logging.Logger = logger or setup_logger("Notifier")
         self.telegram_token: str = Config.TELEGRAM_BOT_TOKEN
@@ -27,7 +30,7 @@ class Notifier:
         """Gửi nội dung tin nhắn dạng HTML qua API Telegram Bot với cơ chế thử lại.
 
         Args:
-            text: Nội dung thông điệp cần gửi, hỗ trợ các thẻ định dạng HTML.
+            text (str): Nội dung thông điệp cần gửi, hỗ trợ các thẻ định dạng HTML.
 
         Raises:
             requests.exceptions.RequestException: Phát sinh khi tất cả các lần thử gửi đều thất bại.
@@ -51,7 +54,9 @@ class Notifier:
         telegram_timeout: int = min(8, Config.NETWORK_TIMEOUT)
         for attempt in range(1, max_retries + 1):
             try:
-                response: requests.Response = requests.post(url, json=payload, timeout=telegram_timeout)
+                response: requests.Response = requests.post(
+                    url, json=payload, timeout=telegram_timeout
+                )
                 response.raise_for_status()
                 self.logger.info("📲 [Telegram] Gửi tin nhắn thành công.")
                 return
@@ -67,19 +72,21 @@ class Notifier:
         """Bọc ngoài cơ chế gửi tin nhắn để đảm bảo lỗi mạng Telegram không làm sập pipeline chính.
 
         Args:
-            text: Nội dung thông điệp cần gửi.
+            text (str): Nội dung thông điệp cần gửi.
         """
         try:
             self._send_telegram(text)
         except Exception as e:
-            self.logger.error(f"❌ [Notifier] Lỗi không mong muốn trong quá trình gửi thông báo: {e}")
+            self.logger.error(
+                f"❌ [Notifier] Lỗi không mong muốn trong quá trình gửi thông báo: {e}"
+            )
 
     def send_alert(self, subject: str, message: str) -> None:
         """Gửi cảnh báo khẩn cấp khi hệ thống gặp lỗi nghiêm trọng (Critical Error).
 
         Args:
-            subject: Tiêu đề hoặc nguồn gốc phát sinh lỗi cảnh báo.
-            message: Chi tiết lỗi hoặc stack trace của ngoại lệ.
+            subject (str): Tiêu đề hoặc nguồn gốc phát sinh lỗi cảnh báo.
+            message (str): Chi tiết lỗi hoặc stack trace của ngoại lệ.
         """
         escaped_subject: str = html.escape(subject)
         escaped_message: str = html.escape(message)
@@ -104,25 +111,30 @@ class Notifier:
         """Gửi báo cáo tổng hợp chi tiết sau khi kết thúc phiên chạy hàng ngày thành công.
 
         Args:
-            date_str: Ngày giao dịch của phiên chạy.
-            total_processed: Tổng số dòng dữ liệu thô T0 đã được ghi nhận.
-            is_eod: Trạng thái chốt phiên cuối ngày EOD (True/False).
-            missing_dates: Danh sách các ngày giao dịch còn thiếu đã chạy backfill.
-            reloaded_symbols: Danh sách các mã cổ phiếu được tải lại giá điều chỉnh thành công.
-            failed_reloads: Danh sách các mã gặp sự cố khi tải lại lịch sử giá điều chỉnh.
-            export_summary: Thông số tóm tắt tiến trình xuất dữ liệu các mã quan tâm lên GCS.
+            date_str (str): Ngày giao dịch của phiên chạy.
+            total_processed (int): Tổng số dòng dữ liệu thô T0 đã được ghi nhận.
+            is_eod (bool): Trạng thái chốt phiên cuối ngày EOD.
+            missing_dates (list[Any]): Danh sách các ngày giao dịch còn thiếu đã chạy backfill.
+            reloaded_symbols (list[str]): Danh sách các mã cổ phiếu được tải lại giá điều chỉnh thành công.
+            failed_reloads (list[str]): Danh sách các mã gặp sự cố khi tải lại lịch sử giá điều chỉnh.
+            export_summary (dict[str, Any] | None): Thông số tóm tắt tiến trình xuất dữ liệu các mã quan tâm lên GCS.
         """
+
         def _format_symbols(symbols: list[str], max_show: int = 15) -> str:
             if not symbols:
                 return "Không có"
             if len(symbols) <= max_show:
                 return ", ".join(symbols)
-            return ", ".join(symbols[:max_show]) + f" (+{len(symbols) - max_show} mã khác)"
+            return (
+                ", ".join(symbols[:max_show]) + f" (+{len(symbols) - max_show} mã khác)"
+            )
 
         status_icon: str = "✅" if not failed_reloads else "⚠️"
         eod_status: str = "Đã chốt EOD 🔒" if is_eod else "Chưa chốt EOD 🔓"
 
-        missing_dates_str: str = ", ".join([str(d) for d in missing_dates]) if missing_dates else "Không có"
+        missing_dates_str: str = (
+            ", ".join([str(d) for d in missing_dates]) if missing_dates else "Không có"
+        )
         reloaded_str: str = _format_symbols(reloaded_symbols)
         failed_str: str = _format_symbols(failed_reloads)
 

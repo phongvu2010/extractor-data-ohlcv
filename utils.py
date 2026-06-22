@@ -1,3 +1,5 @@
+"""Module cung cấp các hàm tiện ích hỗ trợ định dạng logging và bộ giới hạn tần suất API (Rate Limiter)."""
+
 from datetime import datetime, timezone
 import json
 import logging
@@ -16,10 +18,10 @@ def vn_time_converter(*args: Any) -> time.struct_time:
     """Bộ chuyển đổi thời gian sang múi giờ Việt Nam cho logging.
 
     Args:
-        *args: Các tham số truyền vào từ logging.
+        *args (Any): Các tham số truyền vào từ logging.
 
     Returns:
-        Thời gian cấu trúc đại diện cho thời gian hiện tại ở Việt Nam.
+        time.struct_time: Thời gian cấu trúc đại diện cho thời gian hiện tại ở Việt Nam.
     """
     return datetime.now(Config.VN_TZ).timetuple()
 
@@ -38,10 +40,10 @@ class GCPJSONFormatter(logging.Formatter):
         """Định dạng bản ghi log thành chuỗi JSON tương thích với Google Cloud Logging.
 
         Args:
-            record: Đối tượng bản ghi log cần định dạng.
+            record (logging.LogRecord): Đối tượng bản ghi log cần định dạng.
 
         Returns:
-            Chuỗi định dạng JSON của log.
+            str: Chuỗi định dạng JSON của log.
         """
         message: Any = record.getMessage()
         if isinstance(message, str):
@@ -73,11 +75,11 @@ def setup_logger(name: str, level: int = logging.INFO) -> logging.Logger:
     và sử dụng Rich terminal logging khi chạy ở môi trường cục bộ.
 
     Args:
-        name: Tên của đối tượng Logger cần tạo.
-        level: Cấp độ ghi nhận vết log (mặc định là logging.INFO).
+        name (str): Tên của đối tượng Logger cần tạo.
+        level (int): Cấp độ ghi nhận vết log (mặc định là logging.INFO).
 
     Returns:
-        Logger đã được cấu hình phù hợp với môi trường thực thi (Local / Cloud Run).
+        logging.Logger: Logger đã được cấu hình phù hợp với môi trường thực thi (Local / Cloud Run).
     """
     logger: logging.Logger = logging.getLogger(name)
     logger.setLevel(level)
@@ -104,8 +106,8 @@ def setup_logger(name: str, level: int = logging.INFO) -> logging.Logger:
         rich_handler: RichHandler = RichHandler(
             console=custom_console,
             rich_tracebacks=True,  # Hiển thị lỗi traceback chi tiết và trực quan
-            markup=True,           # Hỗ trợ định dạng chữ nghệ thuật (markup)
-            show_path=False,       # Ẩn đường dẫn file để màn hình console gọn gàng hơn
+            markup=True,  # Hỗ trợ định dạng chữ nghệ thuật (markup)
+            show_path=False,  # Ẩn đường dẫn file để màn hình console gọn gàng hơn
             show_time=True,
         )
         logger.addHandler(rich_handler)
@@ -117,10 +119,10 @@ def normalize_exchange(exchange_code: str) -> str:
     """Chuẩn hóa tên sàn giao dịch chứng khoán Việt Nam về dạng thống nhất.
 
     Args:
-        exchange_code: Tên sàn hoặc mã sàn chưa được chuẩn hóa từ nguồn dữ liệu.
+        exchange_code (str): Tên sàn hoặc mã sàn chưa được chuẩn hóa từ nguồn dữ liệu.
 
     Returns:
-        Tên sàn chuẩn hóa thuộc một trong các nhóm: "HoSE", "HNX", "UPCoM", "Unknown".
+        str: Tên sàn chuẩn hóa thuộc một trong các nhóm: "HoSE", "HNX", "UPCoM", "Unknown".
     """
     clean_code: str = str(exchange_code).strip().upper()
     if "HSX" in clean_code or "HOSE" in clean_code:
@@ -148,15 +150,15 @@ class SmartRateLimiter:
         logger: logging.Logger,
         limit: int,
         window: float,
-        micro_sleep: float = 3.5
+        micro_sleep: float = 3.5,
     ) -> None:
         """Khởi tạo bộ giới hạn tốc độ yêu cầu API.
 
         Args:
-            logger: Đối tượng Logger dùng để theo dõi trạng thái.
-            limit: Ngưỡng số lượng cuộc gọi API tối đa trong một chu kỳ window.
-            window: Độ dài khung thời gian làm mát tính bằng giây.
-            micro_sleep: Độ trễ tối thiểu bắt buộc giữa hai yêu cầu liên tiếp.
+            logger (logging.Logger): Đối tượng Logger dùng để theo dõi trạng thái.
+            limit (int): Ngưỡng số lượng cuộc gọi API tối đa trong một chu kỳ window.
+            window (float): Độ dài khung thời gian làm mát tính bằng giây.
+            micro_sleep (float): Độ trễ tối thiểu bắt buộc giữa hai yêu cầu liên tiếp.
         """
         self.logger = logger
         self.limit = limit
@@ -182,7 +184,7 @@ class SmartRateLimiter:
         now = time.time()
         elapsed: float = now - self.last_request_time
 
-        # Ép buộc thời gian nghỉ tối thiểu giữa các cuộc gọi API liên tiếp
+        # Tối ưu: Giãn cách tối thiểu giữa các request để bảo vệ API gateway và tránh bị block IP
         if elapsed < self.micro_sleep:
             time.sleep(self.micro_sleep - elapsed)
 
@@ -192,7 +194,7 @@ class SmartRateLimiter:
         """Kiểm tra xem số lượt yêu cầu đã chạm ngưỡng giới hạn hay chưa.
 
         Returns:
-            True nếu số lượng cuộc gọi chạm hoặc vượt giới hạn, ngược lại False.
+            bool: True nếu số lượng cuộc gọi chạm hoặc vượt giới hạn, ngược lại False.
         """
         return self.count >= self.limit
 
@@ -200,7 +202,8 @@ class SmartRateLimiter:
         """Thực hiện dừng luồng để làm mát API, có thể kết hợp chạy tác vụ phụ song song.
 
         Args:
-            io_task: Tác vụ phụ cần chạy tranh thủ trong thời gian chờ (ví dụ: ghi file).
+            io_task (Callable[[], None] | None): Tác vụ phụ cần chạy tranh thủ
+                trong thời gian chờ (ví dụ: ghi file).
         """
         if io_task:
             io_task()

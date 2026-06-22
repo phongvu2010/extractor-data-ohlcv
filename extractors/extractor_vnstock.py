@@ -1,3 +1,7 @@
+"""Module thực hiện tải, xử lý và làm sạch dữ liệu chứng khoán từ nguồn Vnstock API."""
+
+from __future__ import annotations
+
 from datetime import date, datetime, timedelta
 import gc
 import logging
@@ -35,8 +39,8 @@ class DataProcessor:
         """Khởi tạo bộ xử lý dữ liệu và thiết lập các cổng kết nối API Vnstock.
 
         Args:
-            logger: Đối tượng Logger dùng để ghi nhận tiến trình.
-            source: Nguồn cung cấp dữ liệu chứng khoán mặc định. Nếu None, lấy từ Config.VNSTOCK_DEFAULT_SOURCE.
+            logger (logging.Logger): Đối tượng Logger dùng để ghi nhận tiến trình.
+            source (Optional[str]): Nguồn cung cấp dữ liệu chứng khoán mặc định. Nếu None, lấy từ Config.VNSTOCK_DEFAULT_SOURCE.
         """
         self.logger = logger
         self.source = source or Config.VNSTOCK_DEFAULT_SOURCE
@@ -57,13 +61,15 @@ class DataProcessor:
         """Tải danh sách mã cổ phiếu đang hoạt động cùng với sàn giao dịch tương ứng.
 
         Returns:
-            Dict mapping giữa mã chứng khoán (symbol) và sàn niêm yết (exchange).
+            dict[str, str]: Dict mapping giữa mã chứng khoán (symbol) và sàn niêm yết (exchange).
         """
         self.rate_limiter.hit()
         try:
             df_symbols: pd.DataFrame = self.reference_api.equity().list_by_exchange()
             # Loại trừ trái phiếu, trái phiếu doanh nghiệp và chứng khoán phái sinh
-            df_symbols = df_symbols[~df_symbols["type"].isin(["corpbond", "bond", "future"])]
+            df_symbols = df_symbols[
+                ~df_symbols["type"].isin(["corpbond", "bond", "future"])
+            ]
             return dict(zip(df_symbols["symbol"], df_symbols["exchange"]))
         except Exception as e:
             self.logger.error(f"🛑 Không thể lấy danh sách symbol từ vnstock: {e}")
@@ -73,17 +79,19 @@ class DataProcessor:
         """Tải dữ liệu bảng giá ngày hiện hành T0 hàng loạt cho tất cả các mã chứng khoán.
 
         Args:
-            symbols: Danh sách mã cổ phiếu cần tải thông tin bảng giá.
+            symbols (list[str]): Danh sách mã cổ phiếu cần tải thông tin bảng giá.
 
         Returns:
-            DataFrame dữ liệu giao dịch T0 hoàn chỉnh của toàn bộ thị trường.
+            pd.DataFrame: DataFrame dữ liệu giao dịch T0 hoàn chỉnh của toàn bộ thị trường.
         """
         self.logger.info(
             f"📥 [Bulk Fetch] Đang kéo bảng giá T0 cho {len(symbols)} mã vào RAM..."
         )
 
         if not symbols:
-            self.logger.warning("⚠️ Danh sách symbols trống. Không thể tải bảng giá T0.")
+            self.logger.warning(
+                "⚠️ Danh sách symbols trống. Không thể tải bảng giá T0."
+            )
             return pd.DataFrame()
 
         dfs: list[pd.DataFrame] = []
@@ -148,9 +156,7 @@ class DataProcessor:
         # Loại bỏ các giá trị vô cực (inf) hoặc NaN trước khi tiến hành các phép lọc số học
         price_cols: list[str] = ["open_price", "high_price", "low_price", "close_price"]
         df_all[price_cols] = df_all[price_cols].replace([np.inf, -np.inf], np.nan)
-        df_all = df_all.dropna(
-            subset=price_cols + ["total_volume", "trading_date"]
-        )
+        df_all = df_all.dropna(subset=price_cols + ["total_volume", "trading_date"])
         df_all = df_all[
             ~(
                 (df_all["open_price"] <= 0)
@@ -161,12 +167,13 @@ class DataProcessor:
             )
         ]
 
-        df_all["symbol"] = df_all["symbol"].astype(str).str.strip().str.upper().astype("category")
+        df_all["symbol"] = (
+            df_all["symbol"].astype(str).str.strip().str.upper().astype("category")
+        )
         df_all["exchange"] = df_all["exchange"].astype(
             pd.CategoricalDtype(categories=["HoSE", "HNX", "UPCoM", "Unknown"])
         )
 
-        price_cols: list[str] = ["open_price", "high_price", "low_price", "close_price"]
         df_all[price_cols] = df_all[price_cols].astype("float32")
         df_all["reference_price"] = df_all["reference_price"].astype("float32")
         df_all["average_price"] = df_all["average_price"].astype("float32")
@@ -195,13 +202,13 @@ class DataProcessor:
         """Tải dữ liệu lịch sử OHLCV cho một mã chứng khoán trong khoảng thời gian xác định.
 
         Args:
-            symbol: Mã cổ phiếu cần tải (ví dụ: 'FPT').
-            start_date: Ngày bắt đầu định dạng YYYY-MM-DD.
-            end_date: Ngày kết thúc định dạng YYYY-MM-DD.
-            limit: Số dòng tối đa cho phép tải về.
+            symbol (str): Mã cổ phiếu cần tải (ví dụ: 'FPT').
+            start_date (str): Ngày bắt đầu định dạng YYYY-MM-DD.
+            end_date (str): Ngày kết thúc định dạng YYYY-MM-DD.
+            limit (int): Số dòng tối đa cho phép tải về.
 
         Returns:
-            DataFrame chứa lịch sử OHLCV của mã cổ phiếu, trả về None nếu tất cả các nguồn thất bại.
+            Optional[pd.DataFrame]: DataFrame chứa lịch sử OHLCV của mã cổ phiếu, trả về None nếu tất cả các nguồn thất bại.
         """
         # Tạo danh sách các nguồn để quét thử nếu nguồn chính gặp sự cố
         sources: list[str] = [self.source, "kbs", "msn"]
@@ -211,7 +218,9 @@ class DataProcessor:
         for src in sources:
             self.rate_limiter.hit()
             try:
-                self.logger.info(f"📥 Đang tải dữ liệu ohlcv cho mã {symbol} từ nguồn: {src}")
+                self.logger.info(
+                    f"📥 Đang tải dữ liệu ohlcv cho mã {symbol} từ nguồn: {src}"
+                )
                 df_ohclv: pd.DataFrame | None = self.market_api.equity(symbol).ohlcv(
                     start=start_date,
                     end=end_date,
@@ -220,18 +229,28 @@ class DataProcessor:
                 )
                 if df_ohclv is not None and not df_ohclv.empty:
                     df_ohclv = df_ohclv.copy()
-                    df_ohclv.rename(columns={
-                        "time": "trading_date",
-                        "open": "open_price",
-                        "high": "high_price",
-                        "low": "low_price",
-                        "close": "close_price",
-                        "volume": "total_volume",
-                    }, inplace=True)
+                    df_ohclv.rename(
+                        columns={
+                            "time": "trading_date",
+                            "open": "open_price",
+                            "high": "high_price",
+                            "low": "low_price",
+                            "close": "close_price",
+                            "volume": "total_volume",
+                        },
+                        inplace=True,
+                    )
 
                     # Loại bỏ các giá trị vô cực (inf) hoặc NaN trước khi nhân để tránh lỗi tràn số (overflow)
-                    price_cols: list[str] = ["open_price", "high_price", "low_price", "close_price"]
-                    df_ohclv[price_cols] = df_ohclv[price_cols].replace([np.inf, -np.inf], np.nan)
+                    price_cols: list[str] = [
+                        "open_price",
+                        "high_price",
+                        "low_price",
+                        "close_price",
+                    ]
+                    df_ohclv[price_cols] = df_ohclv[price_cols].replace(
+                        [np.inf, -np.inf], np.nan
+                    )
                     df_ohclv = df_ohclv.dropna(subset=price_cols)
 
                     # Quy đổi đơn vị giá Vnstock (nghìn đồng) về đồng giống file CafeF
@@ -240,9 +259,13 @@ class DataProcessor:
 
                     return df_ohclv
             except Exception as e:
-                self.logger.warning(f"⚠️ Nguồn {src} gặp lỗi khi tải mã {symbol}: {e}. Đang thử nguồn tiếp theo...")
+                self.logger.warning(
+                    f"⚠️ Nguồn {src} gặp lỗi khi tải mã {symbol}: {e}. Đang thử nguồn tiếp theo..."
+                )
 
-        self.logger.error(f"❌ Tất cả các nguồn dữ liệu ohlcv đều thất bại cho mã {symbol}.")
+        self.logger.error(
+            f"❌ Tất cả các nguồn dữ liệu ohlcv đều thất bại cho mã {symbol}."
+        )
         return None
 
     def detect_corporate_actions_via_api(
@@ -251,12 +274,12 @@ class DataProcessor:
         """Quét và phát hiện lịch sự kiện doanh nghiệp của một nhóm mã chứng khoán thông qua API.
 
         Args:
-            symbols: Danh sách các mã cổ phiếu cần quét.
-            start_date: Mốc thời gian bắt đầu quét sự kiện.
-            end_date: Mốc thời gian kết thúc quét sự kiện.
+            symbols (list[str]): Danh sách các mã cổ phiếu cần quét.
+            start_date (date): Mốc thời gian bắt đầu quét sự kiện.
+            end_date (date): Mốc thời gian kết thúc quét sự kiện.
 
         Returns:
-            Danh sách chứa thông tin chi tiết các sự kiện doanh nghiệp.
+            list[dict[str, Any]]: Danh sách chứa thông tin chi tiết các sự kiện doanh nghiệp.
         """
         if not symbols:
             return []
@@ -277,7 +300,7 @@ class DataProcessor:
             batch: list[str] = symbols[i : i + batch_size]
             tickers_str: str = ",".join(batch)
             url: str = (
-                f"https://iq.vietcap.com.vn/api/iq-insight-service/v1/events"
+                f"{Config.URL_EVENTS}"
                 f"?ticker={tickers_str}&fromDate={start_str}&toDate={end_str}"
                 f"&eventCode=DIV,ISS&page=0&size=1000"
             )
@@ -312,7 +335,7 @@ class DataProcessor:
         df_events: pd.DataFrame = pd.concat(all_dfs, ignore_index=True)
         rename_map: dict[str, str] = {
             "exrightDate": "exright_date",
-            "organCode": "organ_code"
+            "organCode": "organ_code",
         }
         df_events = df_events.rename(columns=rename_map)
 
@@ -327,8 +350,7 @@ class DataProcessor:
 
         # Chỉ lọc lấy các sự kiện nằm hoàn toàn trong khoảng thời gian cần kiểm tra
         df_filtered: pd.DataFrame = df_events[
-            (df_events["ex_date"] >= start_date) &
-            (df_events["ex_date"] <= end_date)
+            (df_events["ex_date"] >= start_date) & (df_events["ex_date"] <= end_date)
         ]
 
         if df_filtered.empty:
@@ -353,14 +375,20 @@ class DataProcessor:
                         rec_date_val = pd.to_datetime(row["recordDate"]).date()
                     except Exception:
                         pass
-                ratio_val = str(row.get("exerciseRatio", "")) if pd.notna(row.get("exerciseRatio")) else None
-                events.append({
-                    "symbol": ticker,
-                    "event_type": row.get("eventCode", "DIV"),
-                    "ex_date": ex_date,
-                    "record_date": rec_date_val,
-                    "ratio": ratio_val
-                })
+                ratio_val = (
+                    str(row.get("exerciseRatio", ""))
+                    if pd.notna(row.get("exerciseRatio"))
+                    else None
+                )
+                events.append(
+                    {
+                        "symbol": ticker,
+                        "event_type": row.get("eventCode", "DIV"),
+                        "ex_date": ex_date,
+                        "record_date": rec_date_val,
+                        "ratio": ratio_val,
+                    }
+                )
 
         return events
 
@@ -376,24 +404,24 @@ class VnstockExtractorETL:
         """Khởi tạo các phân lớp phục vụ xử lý và lưu trữ dữ liệu.
 
         Args:
-            logger_name: Tên Logger chung của hệ thống.
+            logger_name (str): Tên Logger chung của hệ thống.
         """
         self.logger = setup_logger(logger_name)
         self.processor = DataProcessor(self.logger)
         self.storage = get_storage(Config.DEPLOYMENT_ENV, self.logger)
 
     def _initialize_run_dates(
-        self,
-        df_t0: pd.DataFrame
+        self, df_t0: pd.DataFrame
     ) -> tuple[date, list[date], list[str], dict[str, Any]] | None:
         """Phân tích checkpoint và kiểm tra tính hợp lệ về ngày chạy dữ liệu mới.
 
         Args:
-            df_t0: DataFrame dữ liệu phiên T0 tải về.
+            df_t0 (pd.DataFrame): DataFrame dữ liệu phiên T0 tải về.
 
         Returns:
-            Tuple chứa các thông tin (t0_max_date, missing_dates, pending_reloads, latest_state)
-            hoặc None nếu hệ thống dừng chạy do trùng lẫn hoặc không có lịch sử mới.
+            Optional[tuple[date, list[date], list[str], dict[str, Any]]]: Tuple chứa các thông tin
+                (t0_max_date, missing_dates, pending_reloads, latest_state)
+                hoặc None nếu hệ thống dừng chạy do trùng lẫn hoặc không có lịch sử mới.
         """
         t0_max_date: date = df_t0["trading_date"].dt.date.max()
 
@@ -412,7 +440,9 @@ class VnstockExtractorETL:
                     f"({'Đã chốt phiên EOD' if is_eod else 'Chưa chốt phiên EOD'})"
                 )
             except Exception as e:
-                self.logger.warning(f"⚠️ Không thể phân tích ngày chạy cuối cùng {last_run_str}: {e}")
+                self.logger.warning(
+                    f"⚠️ Không thể phân tích ngày chạy cuối cùng {last_run_str}: {e}"
+                )
 
         # Chốt chặn thời gian: Dừng chạy nếu ngày tải về cũ hơn ngày đã chạy thành công gần nhất
         if date_latest_state and t0_max_date < date_latest_state:
@@ -448,24 +478,24 @@ class VnstockExtractorETL:
         return t0_max_date, missing_dates, pending_reloads, latest_state
 
     def _detect_corporate_actions_today(
-        self,
-        df_t0: pd.DataFrame,
-        today_date: date
+        self, df_t0: pd.DataFrame, today_date: date
     ) -> dict[str, date]:
         """Phát hiện các sự kiện doanh nghiệp của phiên T0 thông qua quét API.
 
         Args:
-            df_t0: DataFrame dữ liệu T0 để lấy danh sách các mã giao dịch cần quét.
-            today_date: Ngày giao dịch hôm nay.
+            df_t0 (pd.DataFrame): DataFrame dữ liệu T0 để lấy danh sách các mã giao dịch cần quét.
+            today_date (date): Ngày giao dịch hôm nay.
 
         Returns:
-            Dict chứa các mã cổ phiếu và ngày có sự kiện tương ứng.
+            dict[str, date]: Dict chứa các mã cổ phiếu và ngày có sự kiện tương ứng.
         """
         symbols: list[str] = [str(s) for s in df_t0["symbol"].unique() if s]
         self.logger.info(
             f"🔍 [Corporate Actions T0] Đang quét trực tiếp API sự kiện hôm nay cho {len(symbols)} mã..."
         )
-        events = self.processor.detect_corporate_actions_via_api(symbols, today_date, today_date)
+        events = self.processor.detect_corporate_actions_via_api(
+            symbols, today_date, today_date
+        )
         self.storage.save_corporate_events(events)
         return {e["symbol"]: e["ex_date"] for e in events}
 
@@ -473,14 +503,21 @@ class VnstockExtractorETL:
         """Bù lại toàn bộ các ngày giao dịch bị thiếu thông qua extractor CafeF.
 
         Args:
-            missing_dates: Danh sách các ngày cần backfill.
+            missing_dates (list[date]): Danh sách các ngày cần backfill.
         """
-        self.logger.info(f"🚀 Phát hiện {len(missing_dates)} ngày thiếu cần backfill. Tiến hành tải qua CafeF...")
+        self.logger.info(
+            f"🚀 Phát hiện {len(missing_dates)} ngày thiếu cần backfill. Tiến hành tải qua CafeF..."
+        )
         from extractors.extractor_cafef import CafeFExtractorETL
-        cafe_etl: CafeFExtractorETL = CafeFExtractorETL(logger_name=self.logger.name, storage=self.storage)
+
+        cafe_etl: CafeFExtractorETL = CafeFExtractorETL(
+            logger_name=self.logger.name, storage=self.storage
+        )
 
         for m_date in sorted(missing_dates):
-            self.logger.info(f"📅 [Backfill CafeF] Đang tải dữ liệu thô cho ngày {m_date}...")
+            self.logger.info(
+                f"📅 [Backfill CafeF] Đang tải dữ liệu thô cho ngày {m_date}..."
+            )
             dt_ref: datetime = datetime.combine(m_date, datetime.min.time())
             try:
                 res: pd.DataFrame | None = cafe_etl.run(
@@ -496,12 +533,18 @@ class VnstockExtractorETL:
                     try:
                         Notifier(self.logger).send_alert("Cảnh báo Backfill", warn_msg)
                     except Exception as notify_err:
-                        self.logger.error(f"❌ Không thể gửi thông báo lỗi: {notify_err}")
+                        self.logger.error(
+                            f"❌ Không thể gửi thông báo lỗi: {notify_err}"
+                        )
             except Exception as e:
-                err_msg: str = f"❌ Gặp sự cố nghiêm trọng khi chạy backfill cho ngày {m_date.strftime('%Y-%m-%d')}: {e}"
+                err_msg: str = (
+                    f"❌ Gặp sự cố nghiêm trọng khi chạy backfill cho ngày {m_date.strftime('%Y-%m-%d')}: {e}"
+                )
                 self.logger.error(err_msg, exc_info=True)
                 try:
-                    Notifier(self.logger).send_alert("Lỗi Backfill Nghiêm Trọng", err_msg)
+                    Notifier(self.logger).send_alert(
+                        "Lỗi Backfill Nghiêm Trọng", err_msg
+                    )
                 except Exception as notify_err:
                     self.logger.error(f"❌ Không thể gửi thông báo lỗi: {notify_err}")
 
@@ -510,25 +553,25 @@ class VnstockExtractorETL:
         ticker: str,
         today_date: date,
         symbols_map: dict[str, str],
-        df_t0: pd.DataFrame
+        df_t0: pd.DataFrame,
     ) -> bool:
         """Tải lại toàn bộ lịch sử giá điều chỉnh (từ năm 2000) của một mã và đồng bộ lên GCS/BigQuery.
 
         Args:
-            ticker: Mã chứng khoán cần xử lý.
-            today_date: Ngày giao dịch của phiên chạy hiện tại.
-            symbols_map: Bản đồ mã chứng khoán sang sàn giao dịch tương ứng.
-            df_t0: DataFrame dữ liệu T0.
+            ticker (str): Mã chứng khoán cần xử lý.
+            today_date (date): Ngày giao dịch của phiên chạy hiện tại.
+            symbols_map (dict[str, str]): Bản đồ mã chứng khoán sang sàn giao dịch tương ứng.
+            df_t0 (pd.DataFrame): DataFrame dữ liệu T0.
 
         Returns:
-            True nếu quá trình reload và đồng bộ hoàn tất thành công, ngược lại False.
+            bool: True nếu quá trình reload và đồng bộ hoàn tất thành công, ngược lại False.
         """
         try:
             df_hist_adj: pd.DataFrame | None = self.processor.fetch_ohlcv(
                 ticker,
                 start_date="2000-01-01",
                 end_date=datetime.now(Config.VN_TZ).strftime("%Y-%m-%d"),
-                limit=15000
+                limit=15000,
             )
 
             if df_hist_adj is None or df_hist_adj.empty:
@@ -538,20 +581,44 @@ class VnstockExtractorETL:
             df_hist_adj = df_hist_adj.copy()
             df_hist_adj["symbol"] = ticker
             df_hist_adj["exchange"] = symbols_map.get(ticker, "Unknown")
-            df_hist_adj["symbol"] = df_hist_adj["symbol"].astype(str).str.strip().str.upper().astype("category")
-            df_hist_adj["exchange"] = df_hist_adj["exchange"].apply(normalize_exchange).astype(
-                pd.CategoricalDtype(categories=["HoSE", "HNX", "UPCoM", "Unknown"])
+            df_hist_adj["symbol"] = (
+                df_hist_adj["symbol"]
+                .astype(str)
+                .str.strip()
+                .str.upper()
+                .astype("category")
             )
-            df_hist_adj["trading_date"] = pd.to_datetime(df_hist_adj["trading_date"]).dt.normalize()
+            df_hist_adj["exchange"] = (
+                df_hist_adj["exchange"]
+                .apply(normalize_exchange)
+                .astype(
+                    pd.CategoricalDtype(categories=["HoSE", "HNX", "UPCoM", "Unknown"])
+                )
+            )
+            df_hist_adj["trading_date"] = pd.to_datetime(
+                df_hist_adj["trading_date"]
+            ).dt.normalize()
             df_hist_adj = df_hist_adj.dropna(subset=["trading_date"])
 
-            price_cols: list[str] = ["open_price", "high_price", "low_price", "close_price"]
+            price_cols: list[str] = [
+                "open_price",
+                "high_price",
+                "low_price",
+                "close_price",
+            ]
             df_hist_adj[price_cols] = df_hist_adj[price_cols].astype("float32")
             df_hist_adj["total_volume"] = df_hist_adj["total_volume"].astype("Int64")
 
             target_cols: list[str] = [
-                "symbol", "trading_date", "open_price", "high_price", "low_price", "close_price",
-                "total_volume", "exchange", "source"
+                "symbol",
+                "trading_date",
+                "open_price",
+                "high_price",
+                "low_price",
+                "close_price",
+                "total_volume",
+                "exchange",
+                "source",
             ]
             df_hist_adj = df_hist_adj[target_cols]
 
@@ -565,50 +632,78 @@ class VnstockExtractorETL:
                 df_t0_sym: pd.DataFrame = df_t0[df_t0["symbol"] == ticker]
                 if not df_t0_sym.empty:
                     t0_row: pd.Series = df_t0_sym.iloc[0]
-                    df_t0_append: pd.DataFrame = pd.DataFrame([{
-                        "symbol": ticker,
-                        "trading_date": pd.to_datetime(today_date),
-                        "open_price": t0_row["open_price"],
-                        "high_price": t0_row["high_price"],
-                        "low_price": t0_row["low_price"],
-                        "close_price": t0_row["close_price"],
-                        "total_volume": t0_row["total_volume"],
-                        "exchange": symbols_map.get(ticker, "Unknown"),
-                        "source": t0_row.get("source", self.source.lower())
-                    }])
-                    df_t0_append["symbol"] = df_t0_append["symbol"].astype(str).str.strip().str.upper().astype(
-                        "category"
+                    df_t0_append: pd.DataFrame = pd.DataFrame(
+                        [
+                            {
+                                "symbol": ticker,
+                                "trading_date": pd.to_datetime(today_date),
+                                "open_price": t0_row["open_price"],
+                                "high_price": t0_row["high_price"],
+                                "low_price": t0_row["low_price"],
+                                "close_price": t0_row["close_price"],
+                                "total_volume": t0_row["total_volume"],
+                                "exchange": symbols_map.get(ticker, "Unknown"),
+                                "source": t0_row.get("source", self.source.lower()),
+                            }
+                        ]
                     )
-                    df_t0_append["exchange"] = df_t0_append["exchange"].apply(normalize_exchange).astype(
-                        pd.CategoricalDtype(categories=["HoSE", "HNX", "UPCoM", "Unknown"])
+                    df_t0_append["symbol"] = (
+                        df_t0_append["symbol"]
+                        .astype(str)
+                        .str.strip()
+                        .str.upper()
+                        .astype("category")
                     )
-                    df_t0_append["trading_date"] = pd.to_datetime(df_t0_append["trading_date"]).dt.normalize()
-                    df_t0_append[price_cols] = df_t0_append[price_cols].astype("float32")
-                    df_t0_append["total_volume"] = df_t0_append["total_volume"].astype("Int64")
+                    df_t0_append["exchange"] = (
+                        df_t0_append["exchange"]
+                        .apply(normalize_exchange)
+                        .astype(
+                            pd.CategoricalDtype(
+                                categories=["HoSE", "HNX", "UPCoM", "Unknown"]
+                            )
+                        )
+                    )
+                    df_t0_append["trading_date"] = pd.to_datetime(
+                        df_t0_append["trading_date"]
+                    ).dt.normalize()
+                    df_t0_append[price_cols] = df_t0_append[price_cols].astype(
+                        "float32"
+                    )
+                    df_t0_append["total_volume"] = df_t0_append["total_volume"].astype(
+                        "Int64"
+                    )
 
-                    df_hist_adj = pd.concat([df_hist_adj, df_t0_append], ignore_index=True)
+                    df_hist_adj = pd.concat(
+                        [df_hist_adj, df_t0_append], ignore_index=True
+                    )
                     self.logger.info(f"✅ Đã bù thành công dữ liệu T0 cho mã {ticker}.")
                 else:
-                    self.logger.error(f"❌ Không tìm thấy dữ liệu T0 của mã {ticker} trong df_t0 để bù.")
+                    self.logger.error(
+                        f"❌ Không tìm thấy dữ liệu T0 của mã {ticker} trong df_t0 để bù."
+                    )
 
             # Khắc phục trùng lặp ngày trong dữ liệu lịch sử điều chỉnh do lag API
-            df_hist_adj.drop_duplicates(subset=["trading_date"], keep="last", inplace=True)
+            df_hist_adj.drop_duplicates(
+                subset=["trading_date"], keep="last", inplace=True
+            )
 
             # Lưu trữ lên GCS Parquet
             self.storage.save_symbol_history(df_hist_adj, ticker, suffix="adj")
             return True
         except Exception as e:
-            self.logger.error(f"❌ Lỗi khi tải và lưu lên GCS lịch sử mã {ticker}: {e}", exc_info=True)
+            self.logger.error(
+                f"❌ Lỗi khi tải và lưu lên GCS lịch sử mã {ticker}: {e}", exc_info=True
+            )
             return False
 
     def verify_price_units(self, symbols_map: dict[str, str]) -> float:
         """Kiểm tra sự đồng nhất đơn vị giá giữa price_board và ohlcv.
 
         Args:
-            symbols_map: Bản đồ mã chứng khoán sang sàn giao dịch tương ứng.
+            symbols_map (dict[str, str]): Bản đồ mã chứng khoán sang sàn giao dịch tương ứng.
 
         Returns:
-            Hệ số nhân cần áp dụng cho bảng giá T0 (thường là 1000.0 nếu lệch hoặc 1.0 nếu đồng nhất).
+            float: Hệ số nhân cần áp dụng cho bảng giá T0 (thường là 1000.0 nếu lệch hoặc 1.0 nếu đồng nhất).
         """
         default_multiplier: float = 1.0
         if not symbols_map:
@@ -625,7 +720,9 @@ class VnstockExtractorETL:
         try:
             # 1. Lấy giá từ bảng giá T0
             self.processor.rate_limiter.hit()
-            df_board: pd.DataFrame | None = self.processor.trading_api.price_board([ticker])
+            df_board: pd.DataFrame | None = self.processor.trading_api.price_board(
+                [ticker]
+            )
             if df_board is None or df_board.empty:
                 self.logger.warning(
                     f"⚠️ [Unit Check] Không thể lấy bảng giá {ticker} để kiểm tra đơn vị. "
@@ -636,7 +733,9 @@ class VnstockExtractorETL:
 
             # 2. Lấy giá ohlcv lịch sử gần đây (sử dụng hàm fetch_ohlcv đã qua xử lý nhân multiplier)
             today_str: str = datetime.now(Config.VN_TZ).strftime("%Y-%m-%d")
-            start_date: str = (datetime.now(Config.VN_TZ) - timedelta(days=7)).strftime("%Y-%m-%d")
+            start_date: str = (datetime.now(Config.VN_TZ) - timedelta(days=7)).strftime(
+                "%Y-%m-%d"
+            )
 
             df_ohlcv: pd.DataFrame | None = self.processor.fetch_ohlcv(
                 ticker, start_date=start_date, end_date=today_str, limit=5
@@ -650,7 +749,12 @@ class VnstockExtractorETL:
 
             ohlcv_price: float = float(df_ohlcv.iloc[-1]["close_price"])
 
-            if pd.isna(board_price) or pd.isna(ohlcv_price) or board_price <= 0 or ohlcv_price <= 0:
+            if (
+                pd.isna(board_price)
+                or pd.isna(ohlcv_price)
+                or board_price <= 0
+                or ohlcv_price <= 0
+            ):
                 self.logger.warning(
                     f"⚠️ [Unit Check] Giá benchmark bị NaN hoặc không hợp lệ "
                     f"(Bảng giá: {board_price} | OHLCV: {ohlcv_price}). Sử dụng hệ số mặc định 1.0"
@@ -671,7 +775,9 @@ class VnstockExtractorETL:
                 )
                 return 1000.0
             elif 0.8 <= ratio <= 1.2:
-                self.logger.info("✅ Xác nhận đơn vị giá nhất quán giữa Bảng giá và dữ liệu OHLCV. Hệ số nhân: 1.0")
+                self.logger.info(
+                    "✅ Xác nhận đơn vị giá nhất quán giữa Bảng giá và dữ liệu OHLCV. Hệ số nhân: 1.0"
+                )
                 return 1.0
             else:
                 self.logger.warning(
@@ -680,14 +786,17 @@ class VnstockExtractorETL:
                 )
                 return default_multiplier
         except Exception as e:
-            self.logger.error(f"❌ Lỗi trong quá trình kiểm tra tự động đơn vị giá: {e}", exc_info=True)
+            self.logger.error(
+                f"❌ Lỗi trong quá trình kiểm tra tự động đơn vị giá: {e}",
+                exc_info=True,
+            )
             return default_multiplier
 
     def run(self) -> pd.DataFrame | None:
         """Khởi chạy toàn bộ quy trình ETL tải dữ liệu daily, backfill, xử lý sự kiện và đồng bộ lên GCP.
 
         Returns:
-            DataFrame dữ liệu giao dịch T0 ngày hôm nay nếu thành công, ngược lại trả về None.
+            Optional[pd.DataFrame]: DataFrame dữ liệu giao dịch T0 ngày hôm nay nếu thành công, ngược lại trả về None.
         """
         symbols_map: dict[str, str] = self.processor.get_symbols_with_exchange()
 
@@ -695,7 +804,9 @@ class VnstockExtractorETL:
         try:
             self.logger.info("🏢 Bắt đầu cào danh sách công ty từ vnstock...")
             df_symbols = self.processor.reference_api.equity().list_by_exchange()
-            df_symbols = df_symbols[~df_symbols["type"].isin(["corpbond", "bond", "future"])]
+            df_symbols = df_symbols[
+                ~df_symbols["type"].isin(["corpbond", "bond", "future"])
+            ]
 
             # Tải danh sách ngành từ vnstock
             df_industry = self.processor.reference_api.equity().list_by_industry()
@@ -705,19 +816,32 @@ class VnstockExtractorETL:
             if df_ind_level.empty:
                 df_ind_level = df_industry[df_industry["icb_level"] == 1]
 
-            df_merged = pd.merge(df_symbols, df_ind_level[["symbol", "icb_name"]], on="symbol", how="left")
-            df_companies = pd.DataFrame({
-                "symbol": df_merged["symbol"].str.strip().str.upper(),
-                "exchange": df_merged["exchange"].apply(normalize_exchange),
-                "company_name": df_merged["organ_name"].str.strip().fillna("Unknown"),
-                "industry": df_merged["icb_name"].str.strip().fillna("Unknown"),
-                "status": "active"
-            })
+            df_merged = pd.merge(
+                df_symbols,
+                df_ind_level[["symbol", "icb_name"]],
+                on="symbol",
+                how="left",
+            )
+            df_companies = pd.DataFrame(
+                {
+                    "symbol": df_merged["symbol"].str.strip().str.upper(),
+                    "exchange": df_merged["exchange"].apply(normalize_exchange),
+                    "company_name": df_merged["organ_name"]
+                    .str.strip()
+                    .fillna("Unknown"),
+                    "industry": df_merged["icb_name"].str.strip().fillna("Unknown"),
+                    "status": "active",
+                }
+            )
             df_companies.drop_duplicates(subset=["symbol"], inplace=True)
             self.storage.save_companies(df_companies)
-            self.logger.info(f"✅ Đã cào và đồng bộ {len(df_companies)} công ty vào database.")
+            self.logger.info(
+                f"✅ Đã cào và đồng bộ {len(df_companies)} công ty vào database."
+            )
         except Exception as e:
-            self.logger.error(f"❌ Lỗi khi đồng bộ danh sách công ty: {e}", exc_info=True)
+            self.logger.error(
+                f"❌ Lỗi khi đồng bộ danh sách công ty: {e}", exc_info=True
+            )
 
         t0_multiplier: float = self.verify_price_units(symbols_map)
         symbols: list[str] = list(symbols_map.keys())
@@ -733,21 +857,30 @@ class VnstockExtractorETL:
 
         # Áp dụng hệ số nhân đơn vị giá động sau khi tự động kiểm tra
         if t0_multiplier != 1.0:
-            self.logger.info(f"⚡ Áp dụng hệ số nhân {t0_multiplier} cho dữ liệu giá T0 nhằm đồng nhất đơn vị.")
+            self.logger.info(
+                f"⚡ Áp dụng hệ số nhân {t0_multiplier} cho dữ liệu giá T0 nhằm đồng nhất đơn vị."
+            )
             price_cols: list[str] = [
-                "open_price", "high_price", "low_price", "close_price", "reference_price", "average_price"
+                "open_price",
+                "high_price",
+                "low_price",
+                "close_price",
+                "reference_price",
+                "average_price",
             ]
             df_t0[price_cols] *= t0_multiplier
 
         # 1. Khởi tạo và kiểm tra trạng thái lịch chạy gần nhất
-        init_res: tuple[date, list[date], list[str], dict[str, Any]] | None = self._initialize_run_dates(df_t0)
+        init_res: tuple[date, list[date], list[str], dict[str, Any]] | None = (
+            self._initialize_run_dates(df_t0)
+        )
         if init_res is None:
             return None
         today_date, missing_dates, pending_reloads, latest_state = init_res
 
         # 2. Phát hiện các sự kiện chia cổ tức/phát hành thêm cổ phiếu trong phiên T0
-        detected_corporate_actions: dict[str, date] = self._detect_corporate_actions_today(
-            df_t0, today_date
+        detected_corporate_actions: dict[str, date] = (
+            self._detect_corporate_actions_today(df_t0, today_date)
         )
 
         # 3. Phát hiện sự kiện doanh nghiệp của các ngày còn thiếu (Backfill) thông qua quét API
@@ -755,11 +888,15 @@ class VnstockExtractorETL:
             try:
                 backfill_start: date = min(missing_dates)
                 backfill_end: date = max(missing_dates)
-                detected_backfill_events = self.processor.detect_corporate_actions_via_api(
-                    symbols, backfill_start, backfill_end
+                detected_backfill_events = (
+                    self.processor.detect_corporate_actions_via_api(
+                        symbols, backfill_start, backfill_end
+                    )
                 )
                 self.storage.save_corporate_events(detected_backfill_events)
-                detected_backfill_map = {e["symbol"]: e["ex_date"] for e in detected_backfill_events}
+                detected_backfill_map = {
+                    e["symbol"]: e["ex_date"] for e in detected_backfill_events
+                }
                 if detected_backfill_map:
                     self.logger.warning(
                         f"🔔 [Backfill] Phát hiện {len(detected_backfill_map)} mã có sự kiện trong thời gian backfill: "
@@ -767,7 +904,10 @@ class VnstockExtractorETL:
                     )
                     detected_corporate_actions.update(detected_backfill_map)
             except Exception as e:
-                self.logger.error(f"⚠️ Lỗi khi quét sự kiện doanh nghiệp Backfill qua API: {e}", exc_info=True)
+                self.logger.error(
+                    f"⚠️ Lỗi khi quét sự kiện doanh nghiệp Backfill qua API: {e}",
+                    exc_info=True,
+                )
 
         # Hợp nhất danh sách mã lỗi của phiên chạy trước để thử lại trong hôm nay
         if pending_reloads:
@@ -775,7 +915,7 @@ class VnstockExtractorETL:
                 f"🔄 Phát hiện {len(pending_reloads)} mã bị lỗi reload phiên trước, "
                 f"tự động đưa vào danh sách chạy lại hôm nay: {pending_reloads}"
             )
-            ticker_pattern = re.compile(r"^[A-Z0-9]{3,10}$")
+            ticker_pattern: re.Pattern[str] = re.compile(r"^[A-Z0-9]{3,10}$")
             for p_ticker in pending_reloads:
                 p_ticker_clean: str = str(p_ticker).strip().upper()
                 if ticker_pattern.match(p_ticker_clean):
@@ -790,13 +930,19 @@ class VnstockExtractorETL:
             self._backfill_missing_history(missing_dates)
 
         # 5. Lưu dữ liệu thô T0 lên GCS và nạp vào BigQuery
-        df_t0_parquet: pd.DataFrame = df_t0.drop(columns=["reference_price", "average_price"], errors="ignore")
+        df_t0_parquet: pd.DataFrame = df_t0.drop(
+            columns=["reference_price", "average_price"], errors="ignore"
+        )
         gcs_path_t0: str | None = self.storage.save_parquet(
-            df_t0_parquet, datetime.combine(today_date, datetime.min.time()), partition=True
+            df_t0_parquet,
+            datetime.combine(today_date, datetime.min.time()),
+            partition=True,
         )
 
         if gcs_path_t0:
-            self.storage.sync_partition_to_bigquery(gcs_path_t0, Config.BQ_RAW_TABLE, today_date)
+            self.storage.sync_partition_to_bigquery(
+                gcs_path_t0, Config.BQ_RAW_TABLE, today_date
+            )
 
         # 6. Tải lại toàn bộ lịch sử Giá điều chỉnh cho các mã có sự kiện doanh nghiệp
         failed_reloads: list[str] = []
@@ -807,42 +953,73 @@ class VnstockExtractorETL:
                 f"🚀 Bắt đầu tải lại toàn bộ lịch sử Giá điều chỉnh cho {len(tickers_list)} mã "
                 f"phát hiện được: {tickers_list}..."
             )
-            for ticker in tickers_list:
-                success: bool = self._reload_adjusted_history(ticker, today_date, symbols_map, df_t0)
-                if not success:
-                    failed_reloads.append(ticker)
-                else:
-                    successful_reloads.append(ticker)
-                # Dọn dẹp bộ nhớ chủ động tránh rủi ro OOM trên Cloud Run
-                gc.collect()
 
-            # Đồng bộ gộp dữ liệu lịch sử điều chỉnh lên BigQuery
-            if successful_reloads:
-                self.logger.info(f"⚡ Bắt đầu đồng bộ gộp BigQuery cho các mã đã tải thành công: {successful_reloads}")
-                self.storage.sync_adjusted_symbols_to_bigquery(successful_reloads)
+            # Chia nhỏ danh sách mã cần reload thành các lô tối đa 10 mã để tránh rủi ro OOM và giải phóng RAM sớm
+            reload_batch_size: int = 10
+            for b_idx in range(0, len(tickers_list), reload_batch_size):
+                batch_tickers: list[str] = tickers_list[
+                    b_idx : b_idx + reload_batch_size
+                ]
+                self.logger.info(
+                    f"📦 [Reload Batch] Đang xử lý lô {b_idx // reload_batch_size + 1} "
+                    f"gồm {len(batch_tickers)} mã: {batch_tickers}"
+                )
+
+                successful_batch: list[str] = []
+                for ticker in batch_tickers:
+                    success: bool = self._reload_adjusted_history(
+                        ticker, today_date, symbols_map, df_t0
+                    )
+                    if not success:
+                        failed_reloads.append(ticker)
+                    else:
+                        successful_batch.append(ticker)
+                        successful_reloads.append(ticker)
+                    # Dọn dẹp bộ nhớ chủ động cho từng mã
+                    gc.collect()
+
+                # Đồng bộ gộp dữ liệu của lô hiện tại lên database ngay lập tức
+                if successful_batch:
+                    self.logger.info(
+                        f"⚡ [Reload Batch] Đồng bộ gộp lên database cho các mã thành công của lô: {successful_batch}"
+                    )
+                    self.storage.sync_adjusted_symbols_to_bigquery(successful_batch)
+
+                # Giải phóng RAM chủ động sau mỗi lô
+                del successful_batch
+                gc.collect()
         else:
-            self.logger.info("ℹ️ Không phát hiện mã cổ phiếu nào cần tải lại lịch sử Giá điều chỉnh.")
+            self.logger.info(
+                "ℹ️ Không phát hiện mã cổ phiếu nào cần tải lại lịch sử Giá điều chỉnh."
+            )
 
         # 7. Đồng bộ dữ liệu giá từ bảng raw sang bảng adjusted (tránh các mã có sự kiện)
         all_processing_dates: list[date] = sorted(missing_dates + [today_date])
         all_excluded_symbols: list[str] = list(detected_corporate_actions.keys())
         # Tối ưu hóa: Gọi lệnh SQL bulk đồng bộ tất cả các ngày trong một Transaction duy nhất
-        self.storage.sync_daily_adjusted_prices(all_processing_dates, all_excluded_symbols)
+        self.storage.sync_daily_adjusted_prices(
+            all_processing_dates, all_excluded_symbols
+        )
 
         # 8. Cập nhật Checkpoint Snapshot EOD và lưu danh sách mã bị lỗi để xử lý sau
         self.storage.save_checkpoint(
             df=df_t0,
             active_symbols=set(symbols),
-            pending_adjusted_reloads=failed_reloads
+            pending_adjusted_reloads=failed_reloads,
         )
-        self.logger.info("🎉 Đã lưu checkpoint cập nhật trạng thái thị trường EOD thành công.")
+        self.logger.info(
+            "🎉 Đã lưu checkpoint cập nhật trạng thái thị trường EOD thành công."
+        )
 
         # 8.5. Trích xuất dữ liệu của các mã cổ phiếu quan tâm lên GCS
         export_summary: dict[str, Any] | None = None
         try:
             export_summary = self.storage.export_interested_tickers_data()
         except Exception as export_err:
-            self.logger.error(f"❌ Lỗi khi trích xuất dữ liệu các mã cổ phiếu quan tâm: {export_err}", exc_info=True)
+            self.logger.error(
+                f"❌ Lỗi khi trích xuất dữ liệu các mã cổ phiếu quan tâm: {export_err}",
+                exc_info=True,
+            )
 
         # 9. Gửi báo cáo thông báo trạng thái kết thúc phiên chạy qua Telegram
         try:
@@ -850,11 +1027,13 @@ class VnstockExtractorETL:
             today_str_check: str = vn_now.strftime("%Y-%m-%d")
             t0_date_str: str = today_date.strftime("%Y-%m-%d")
             run_is_eod: bool = (
-                t0_date_str < today_str_check or
-                vn_now.hour > 15 or
-                (vn_now.hour == 15 and vn_now.minute >= 15)
+                t0_date_str < today_str_check
+                or vn_now.hour > 15
+                or (vn_now.hour == 15 and vn_now.minute >= 15)
             )
-            reloaded_symbols: list[str] = [s for s in detected_corporate_actions.keys() if s not in failed_reloads]
+            reloaded_symbols: list[str] = [
+                s for s in detected_corporate_actions.keys() if s not in failed_reloads
+            ]
 
             Notifier(self.logger).send_summary(
                 date_str=t0_date_str,
@@ -863,7 +1042,7 @@ class VnstockExtractorETL:
                 missing_dates=missing_dates,
                 reloaded_symbols=reloaded_symbols,
                 failed_reloads=failed_reloads,
-                export_summary=export_summary
+                export_summary=export_summary,
             )
         except Exception as notify_err:
             self.logger.error(f"❌ Không thể gửi báo cáo chạy daily: {notify_err}")

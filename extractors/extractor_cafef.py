@@ -1,3 +1,7 @@
+"""Module thực hiện tải và làm sạch dữ liệu chứng khoán dạng tệp ZIP lịch sử từ nguồn CafeF."""
+
+from __future__ import annotations
+
 import contextlib
 from datetime import datetime
 import gc
@@ -30,54 +34,66 @@ class Downloader:
         """Khởi tạo bộ tải dữ liệu.
 
         Args:
-            logger: Đối tượng Logger dùng để ghi nhận tiến trình.
+            logger (logging.Logger): Đối tượng Logger dùng để ghi nhận tiến trình.
         """
         self.logger = logger
         self.session = requests.Session()
 
         # Giả lập Header thông dụng để tránh bị chặn bởi các cơ chế bot filter cơ bản của CDN
-        self.session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "Anonymized/7cb0ab2238 AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-        })
+        self.session.headers.update(
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "Anonymized/7cb0ab2238 AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+            }
+        )
 
         # Cấu hình tự động retry 3 lần nếu gặp sự cố HTTP server hoặc timeout đột xuất
         retries: Retry = Retry(
             total=3,
             backoff_factor=2,  # Khoảng giãn cách giữa các lần thử lại là 2s, 4s, 8s
-            status_forcelist=[500, 502, 503, 504]
+            status_forcelist=[500, 502, 503, 504],
         )
         self.session.mount("http://", HTTPAdapter(max_retries=retries))
         self.session.mount("https://", HTTPAdapter(max_retries=retries))
 
-    def __enter__(self) -> "Downloader":
+    def __enter__(self) -> Downloader:
         """Hỗ trợ cơ chế quản lý ngữ cảnh (Context Manager).
 
         Returns:
-            Đối tượng Downloader hiện tại.
+            Downloader: Đối tượng Downloader hiện tại.
         """
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        """Tự động đóng session giải phóng connection pool khi thoát khối lệnh with."""
+        """Tự động đóng session giải phóng connection pool khi thoát khối lệnh with.
+
+        Args:
+            exc_type (Any): Loại ngoại lệ phát sinh nếu có.
+            exc_val (Any): Giá trị ngoại lệ phát sinh nếu có.
+            exc_tb (Any): Traceback ngoại lệ phát sinh nếu có.
+        """
         if self.session:
             self.session.close()
-            self.logger.info("🔌 [Downloader] Đã đóng tài nguyên kết nối mạng an toàn sau khi sử dụng.")
+            self.logger.info(
+                "🔌 [Downloader] Đã đóng tài nguyên kết nối mạng an toàn sau khi sử dụng."
+            )
 
-    def download_zip_stream(self, date_ref: datetime, is_raw: bool) -> io.BytesIO | None:
+    def download_zip_stream(
+        self, date_ref: datetime, is_raw: bool
+    ) -> io.BytesIO | None:
         """Tải tệp zip chứa dữ liệu lịch sử từ CafeF về bộ nhớ đệm RAM.
 
         Args:
-            date_ref: Ngày cần tải dữ liệu giao dịch.
-            is_raw: True để tải giá thô (Raw), False để tải giá điều chỉnh (Adj).
+            date_ref (datetime): Ngày cần tải dữ liệu giao dịch.
+            is_raw (bool): True để tải giá thô (Raw), False để tải giá điều chỉnh (Adj).
 
         Returns:
-            Luồng BytesIO của tệp ZIP nếu thành công, ngược lại trả về None.
+            io.BytesIO | None: Luồng BytesIO của tệp ZIP nếu thành công, ngược lại trả về None.
         """
         raw_prefix: str = "Raw." if is_raw else ""
         date_str_file: str = date_ref.strftime("%d%m%Y")
@@ -88,7 +104,9 @@ class Downloader:
 
         # Áp dụng cơ chế Jitter ngẫu nhiên tránh spam request hàng loạt khi chạy khởi tạo lịch sử
         sleep_time: float = random.uniform(1.5, 3.5)
-        self.logger.info(f"⏳ [Downloader] Chờ {sleep_time:.2f}s để giãn cách tần suất request...")
+        self.logger.info(
+            f"⏳ [Downloader] Chờ {sleep_time:.2f}s để giãn cách tần suất request..."
+        )
         time.sleep(sleep_time)
 
         self.logger.info(
@@ -98,18 +116,24 @@ class Downloader:
 
         try:
             # Dùng stream=True để trì hoãn việc tải body giúp tối ưu hóa kiểm tra trước
-            with self.session.get(url, timeout=Config.NETWORK_TIMEOUT, stream=True) as response:
+            with self.session.get(
+                url, timeout=Config.NETWORK_TIMEOUT, stream=True
+            ) as response:
                 response.raise_for_status()
 
                 # Vòng kiểm tra 1: Xác nhận không phải trang HTML lỗi của Cloudflare/CDN
                 content_type: str = response.headers.get("Content-Type", "")
                 if "text/html" in content_type:
-                    self.logger.error("❌ [CafeF] URL trả về trang HTML, không phải file ZIP hợp lệ.")
+                    self.logger.error(
+                        "❌ [CafeF] URL trả về trang HTML, không phải file ZIP hợp lệ."
+                    )
                     return None
 
                 # Vòng kiểm tra 2: Kiểm tra Magic Bytes đầu tiên của định dạng file ZIP (Hex: 50 4B 03 04)
                 zip_magic_start: bytes = b"PK\x03\x04"
-                stream_iterator: Iterator[bytes] = response.iter_content(chunk_size=65536)
+                stream_iterator: Iterator[bytes] = response.iter_content(
+                    chunk_size=65536
+                )
 
                 try:
                     first_chunk: bytes = next(stream_iterator)
@@ -134,7 +158,9 @@ class Downloader:
                 return zip_stream
 
         except requests.exceptions.Timeout as e:
-            self.logger.error(f"⏳ [CafeF] Yêu cầu bị Timeout sau {Config.NETWORK_TIMEOUT} giây: {e}")
+            self.logger.error(
+                f"⏳ [CafeF] Yêu cầu bị Timeout sau {Config.NETWORK_TIMEOUT} giây: {e}"
+            )
         except requests.exceptions.HTTPError as e:
             if e.response is not None and e.response.status_code == 404:
                 self.logger.warning(
@@ -155,12 +181,14 @@ class DataProcessor:
     storage: BaseStorage | None
     blacklist: set[str]
 
-    def __init__(self, logger: logging.Logger, storage: BaseStorage | None = None) -> None:
+    def __init__(
+        self, logger: logging.Logger, storage: BaseStorage | None = None
+    ) -> None:
         """Khởi tạo bộ xử lý dữ liệu và tải danh sách đen (Blacklist) loại bỏ các mã không hợp lệ.
 
         Args:
-            logger: Đối tượng Logger dùng để ghi nhận tiến trình.
-            storage: Đối tượng Storage dùng để đọc blacklist từ GCS.
+            logger (logging.Logger): Đối tượng Logger dùng để ghi nhận tiến trình.
+            storage (BaseStorage | None): Đối tượng Storage dùng để đọc blacklist từ GCS.
         """
         self.logger = logger
         self.storage = storage
@@ -170,7 +198,7 @@ class DataProcessor:
         """Tải tập hợp danh sách các mã rác, mã ảo cần loại bỏ.
 
         Returns:
-            Set chứa các mã chứng khoán viết hoa thuộc danh sách đen.
+            set[str]: Set chứa các mã chứng khoán viết hoa thuộc danh sách đen.
         """
         if self.storage:
             try:
@@ -181,28 +209,38 @@ class DataProcessor:
                 )
 
         try:
-            with open("blacklist.txt", "r", encoding="utf-8") as file:
+            with open(Config.GCS_BLACKLIST_KEY, "r", encoding="utf-8") as file:
                 return {
                     line.strip().upper()
                     for line in file
                     if line.strip() and not line.strip().startswith("#")
                 }
         except FileNotFoundError:
-            self.logger.warning("⚠️ [CafeF] Không tìm thấy file 'blacklist.txt' cục bộ. Bỏ qua bộ lọc danh sách đen.")
+            self.logger.warning(
+                f"⚠️ [CafeF] Không tìm thấy file '{Config.GCS_BLACKLIST_KEY}' cục bộ. Bỏ qua bộ lọc danh sách đen."
+            )
             return set()
 
-    def _get_column_names(self, include_exchange: bool = True, include_source: bool = False) -> list[str]:
+    def _get_column_names(
+        self, include_exchange: bool = True, include_source: bool = False
+    ) -> list[str]:
         """Lấy danh sách tên các cột dữ liệu theo thứ tự chuẩn.
 
         Args:
-            include_exchange: Có bao gồm cột thông tin sàn giao dịch 'exchange' hay không.
-            include_source: Có bao gồm cột thông tin nguồn dữ liệu 'source' hay không.
+            include_exchange (bool): Có bao gồm cột thông tin sàn giao dịch 'exchange' hay không.
+            include_source (bool): Có bao gồm cột thông tin nguồn dữ liệu 'source' hay không.
 
         Returns:
-            Danh sách tên cột.
+            list[str]: Danh sách tên cột.
         """
         cols: list[str] = [
-            "symbol", "trading_date", "open_price", "high_price", "low_price", "close_price", "total_volume"
+            "symbol",
+            "trading_date",
+            "open_price",
+            "high_price",
+            "low_price",
+            "close_price",
+            "total_volume",
         ]
         if include_exchange:
             cols.append("exchange")
@@ -214,11 +252,11 @@ class DataProcessor:
         """Làm sạch và downcast kiểu dữ liệu cho một phân đoạn (Chunk) bằng vector hóa.
 
         Args:
-            chunk: Phân đoạn DataFrame thô đọc từ CSV.
-            exchange_name: Tên sàn giao dịch của phân đoạn.
+            chunk (pd.DataFrame): Phân đoạn DataFrame thô đọc từ CSV.
+            exchange_name (str): Tên sàn giao dịch của phân đoạn.
 
         Returns:
-            DataFrame đã xử lý lỗi logic, ép kiểu dữ liệu và lọc danh sách đen.
+            pd.DataFrame: DataFrame đã xử lý lỗi logic, ép kiểu dữ liệu và lọc danh sách đen.
         """
         chunk = chunk.dropna(subset=["symbol", "trading_date"])
         if chunk.empty:
@@ -265,13 +303,17 @@ class DataProcessor:
         """Trích xuất, xử lý làm sạch và hợp nhất các file CSV bên trong tệp ZIP.
 
         Args:
-            zip_data: Luồng dữ liệu tệp ZIP nằm trong bộ nhớ RAM.
+            zip_data (io.BytesIO): Luồng dữ liệu tệp ZIP nằm trong bộ nhớ RAM.
 
         Returns:
-            DataFrame hoàn chỉnh đã chuẩn hóa toàn bộ dữ liệu.
+            pd.DataFrame: DataFrame hoàn chỉnh đã chuẩn hóa toàn bộ dữ liệu.
         """
-        cols_order: list[str] = self._get_column_names(include_exchange=False, include_source=False)
-        final_cols_order: list[str] = self._get_column_names(include_exchange=True, include_source=True)
+        cols_order: list[str] = self._get_column_names(
+            include_exchange=False, include_source=False
+        )
+        final_cols_order: list[str] = self._get_column_names(
+            include_exchange=True, include_source=True
+        )
 
         csv_dtypes: dict[str, str] = {
             "symbol": "str",
@@ -284,13 +326,17 @@ class DataProcessor:
 
         dfs: list[pd.DataFrame] = []
         with zipfile.ZipFile(zip_data) as z:
-            csv_files: list[str] = [name for name in z.namelist() if name.endswith(".csv")]
+            csv_files: list[str] = [
+                name for name in z.namelist() if name.endswith(".csv")
+            ]
             if not csv_files:
                 self.logger.warning("📭 Tệp Zip trống hoặc không chứa file '.csv' nào.")
                 return pd.DataFrame(columns=final_cols_order)
 
             for name in csv_files:
-                self.logger.info(f"📂 Đang trích xuất & xử lý stream sàn: [yellow]{name}[/yellow]")
+                self.logger.info(
+                    f"📂 Đang trích xuất & xử lý stream sàn: [yellow]{name}[/yellow]"
+                )
                 detected_exchange: str = normalize_exchange(name)
 
                 with z.open(name) as f:
@@ -309,7 +355,9 @@ class DataProcessor:
                                 date_format="%Y%m%d",
                             )
                             for chunk in chunks:
-                                clean_df: pd.DataFrame = self._clean_chunk(chunk, detected_exchange)
+                                clean_df: pd.DataFrame = self._clean_chunk(
+                                    chunk, detected_exchange
+                                )
                                 if not clean_df.empty:
                                     dfs.append(clean_df)
                                 del chunk
@@ -333,8 +381,12 @@ class DataProcessor:
         result_df["symbol"] = result_df["symbol"].astype("category")
 
         # Sắp xếp và chỉ giữ lại bản ghi giao dịch mới nhất của ngày nếu có trùng lặp
-        result_df.sort_values(by=["symbol", "trading_date"], inplace=True, ignore_index=True)
-        result_df.drop_duplicates(subset=["symbol", "trading_date"], keep="last", inplace=True)
+        result_df.sort_values(
+            by=["symbol", "trading_date"], inplace=True, ignore_index=True
+        )
+        result_df.drop_duplicates(
+            subset=["symbol", "trading_date"], keep="last", inplace=True
+        )
 
         return result_df[final_cols_order]
 
@@ -354,8 +406,8 @@ class CafeFExtractorETL:
         """Khởi tạo đối tượng ETL và cấu hình kết nối các phân lớp.
 
         Args:
-            logger_name: Tên Logger hệ thống dùng chung.
-            storage: Đối tượng Storage chia sẻ kết nối GCP.
+            logger_name (str): Tên Logger hệ thống dùng chung.
+            storage (BaseStorage | None): Đối tượng Storage chia sẻ kết nối GCP.
         """
         self.logger = setup_logger(logger_name)
         self.storage = storage or get_storage(Config.DEPLOYMENT_ENV, self.logger)
@@ -371,29 +423,38 @@ class CafeFExtractorETL:
         """Thực thi quy trình ETL tải, xử lý làm sạch và nạp dữ liệu CafeF.
 
         Args:
-            date_ref: Mốc thời gian cần chạy dữ liệu.
-            is_raw: True nếu tải giá thô, False nếu tải giá điều chỉnh.
-            partition: True để lưu phân mảnh thư mục ngày, False để lưu file tổng hợp tĩnh.
-            save_checkpoint: Có cập nhật trạng thái EOD checkpoint lên GCS hay không.
+            date_ref (datetime): Mốc thời gian cần chạy dữ liệu.
+            is_raw (bool): True nếu tải giá thô, False nếu tải giá điều chỉnh.
+            partition (bool): True để lưu phân mảnh thư mục ngày, False để lưu file tổng hợp tĩnh.
+            save_checkpoint (bool): Có cập nhật trạng thái EOD checkpoint lên GCS hay không.
 
         Returns:
-            DataFrame kết quả nếu chạy hoàn tất thành công, ngược lại trả về None.
+            pd.DataFrame | None: DataFrame kết quả nếu chạy hoàn tất thành công, ngược lại trả về None.
         """
         suffix: str = "raw" if is_raw else "adj"
-        self.logger.info(f"🚀 Khởi chạy Pipeline CafeF [{suffix.upper()}] ngày: {date_ref.strftime('%Y-%m-%d')}")
+        self.logger.info(
+            f"🚀 Khởi chạy Pipeline CafeF [{suffix.upper()}] ngày: {date_ref.strftime('%Y-%m-%d')}"
+        )
 
         with Downloader(self.logger) as downloader:
-            with contextlib.closing(downloader.download_zip_stream(date_ref, is_raw=is_raw)) as zip_stream:
+            with contextlib.closing(
+                downloader.download_zip_stream(date_ref, is_raw=is_raw)
+            ) as zip_stream:
                 if not zip_stream or zip_stream.getvalue() == b"":
-                    self.logger.error("🛑 Pipeline kết thúc sớm do không tải được tệp tin zip từ máy chủ.")
+                    self.logger.error(
+                        "🛑 Pipeline kết thúc sớm do không tải được tệp tin zip từ máy chủ."
+                    )
                     if save_checkpoint:
                         try:
+                            date_str: str = date_ref.strftime("%Y-%m-%d")
                             Notifier(self.logger).send_alert(
                                 f"Lỗi chạy CafeF [{suffix.upper()}]",
-                                f"Không tải được tệp tin ZIP từ máy chủ CafeF cho ngày {date_ref.strftime('%Y-%m-%d')}."
+                                f"Không tải được tệp tin ZIP từ máy chủ CafeF cho ngày {date_str}.",
                             )
                         except Exception as notify_err:
-                            self.logger.error(f"❌ Không thể gửi thông báo lỗi CafeF: {notify_err}")
+                            self.logger.error(
+                                f"❌ Không thể gửi thông báo lỗi CafeF: {notify_err}"
+                            )
                     return None
 
                 try:
@@ -401,41 +462,61 @@ class CafeFExtractorETL:
 
                     if partition:
                         # Chỉ lấy dữ liệu đúng ngày cần chạy để nạp phân mảnh
-                        df = df[pd.to_datetime(df["trading_date"]).dt.date == date_ref.date()].copy()
+                        df = df[
+                            pd.to_datetime(df["trading_date"]).dt.date
+                            == date_ref.date()
+                        ].copy()
 
                     if df.empty:
-                        self.logger.error("🛑 Pipeline kết thúc sớm do tập dữ liệu sau khi làm sạch trống rỗng.")
+                        self.logger.error(
+                            "🛑 Pipeline kết thúc sớm do tập dữ liệu sau khi làm sạch trống rỗng."
+                        )
                         if save_checkpoint:
                             try:
+                                date_str: str = date_ref.strftime("%Y-%m-%d")
                                 Notifier(self.logger).send_alert(
                                     f"Lỗi chạy CafeF [{suffix.upper()}]",
-                                    f"Tập dữ liệu sau khi làm sạch trống rỗng cho ngày {date_ref.strftime('%Y-%m-%d')}."
+                                    f"Tập dữ liệu sau khi làm sạch trống rỗng cho ngày {date_str}.",
                                 )
                             except Exception as notify_err:
-                                self.logger.error(f"❌ Không thể gửi thông báo lỗi CafeF: {notify_err}")
+                                self.logger.error(
+                                    f"❌ Không thể gửi thông báo lỗi CafeF: {notify_err}"
+                                )
                         return None
 
-                    self.logger.info(f"✅ Tải và làm sạch dữ liệu thành công! Kích thước: {df.shape}")
+                    self.logger.info(
+                        f"✅ Tải và làm sạch dữ liệu thành công! Kích thước: {df.shape}"
+                    )
 
-                    gcs_path: str | None = self.storage.save_parquet(df, date_ref, suffix, partition=partition)
+                    gcs_path: str | None = self.storage.save_parquet(
+                        df, date_ref, suffix, partition=partition
+                    )
 
                     # Nạp trực tiếp dữ liệu từ file GCS lên BigQuery
                     if gcs_path:
-                        target_table: str = Config.BQ_RAW_TABLE if is_raw else Config.BQ_ADJ_TABLE
+                        target_table: str = (
+                            Config.BQ_RAW_TABLE if is_raw else Config.BQ_ADJ_TABLE
+                        )
                         if partition:
-                            self.storage.sync_partition_to_bigquery(gcs_path, target_table, date_ref.date())
+                            self.storage.sync_partition_to_bigquery(
+                                gcs_path, target_table, date_ref.date()
+                            )
                         else:
                             self.logger.warning(
                                 f"⚠️ Đang nạp toàn bộ lịch sử ở chế độ WRITE_TRUNCATE cho bảng {target_table}..."
                             )
                             self.storage.load_parquet_to_bigquery(
-                                gcs_path, target_table, write_disposition="WRITE_TRUNCATE"
+                                gcs_path,
+                                target_table,
+                                write_disposition="WRITE_TRUNCATE",
                             )
 
                     if is_raw and save_checkpoint:
                         self.storage.save_checkpoint(df)
 
-                    self.logger.info(f"🏁 Pipeline hoàn thành xuất sắc! Tổng số dòng xử lý: {df.shape[0]:,}")
+                    self.logger.info(
+                        f"🏁 Pipeline hoàn thành xuất sắc! Tổng số dòng xử lý: {df.shape[0]:,}"
+                    )
                     if save_checkpoint:
                         try:
                             Notifier(self.logger).send_message(
@@ -447,16 +528,23 @@ class CafeFExtractorETL:
                                 f"⏰ <i>Thời gian: {datetime.now(Config.VN_TZ).strftime('%Y-%m-%d %H:%M:%S')}</i>"
                             )
                         except Exception as notify_err:
-                            self.logger.error(f"❌ Không thể gửi báo cáo chạy CafeF: {notify_err}")
+                            self.logger.error(
+                                f"❌ Không thể gửi báo cáo chạy CafeF: {notify_err}"
+                            )
                     return df
                 except Exception as e:
-                    self.logger.error(f"❌ Hệ thống ETL gặp sự cố nghiêm trọng bất ngờ: {e}", exc_info=True)
+                    self.logger.error(
+                        f"❌ Hệ thống ETL gặp sự cố nghiêm trọng bất ngờ: {e}",
+                        exc_info=True,
+                    )
                     if save_checkpoint:
                         try:
                             Notifier(self.logger).send_alert(
                                 f"Sập Hệ thống CafeF [{suffix.upper()}]",
-                                f"{type(e).__name__}: {str(e)}"
+                                f"{type(e).__name__}: {str(e)}",
                             )
                         except Exception as notify_err:
-                            self.logger.error(f"❌ Không thể gửi thông báo lỗi CafeF: {notify_err}")
+                            self.logger.error(
+                                f"❌ Không thể gửi thông báo lỗi CafeF: {notify_err}"
+                            )
                     return None

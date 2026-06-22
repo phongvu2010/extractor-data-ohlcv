@@ -1,3 +1,5 @@
+"""Module khởi chạy chính kích hoạt pipeline tải dữ liệu daily."""
+
 from datetime import datetime
 import logging
 import os
@@ -11,8 +13,9 @@ from utils import setup_logger
 def main() -> None:
     """Hàm khởi động chính của Vnstock Daily Pipeline.
 
-    Hàm thực hiện cấu hình Logger, áp dụng các chốt chặn cuối tuần và ngày lễ nghỉ giao dịch
-    của thị trường chứng khoán Việt Nam, sau đó kích hoạt luồng chạy daily tự động.
+    Hàm thực hiện cấu hình Logger, áp dụng các chốt chặn cuối tuần
+    và ngày lễ nghỉ giao dịch của thị trường chứng khoán Việt Nam,
+    sau đó kích hoạt luồng chạy daily tự động.
     """
     logger: logging.Logger = setup_logger(Config.DEFAULT_LOGGER_NAME)
     logger.info("[bold cyan]🚀 === KHỞI ĐỘNG PIPELINE (DAILY MODE) ===[/bold cyan]")
@@ -25,7 +28,7 @@ def main() -> None:
         )
 
     try:
-        # Chốt chặn thời gian: Bỏ qua chạy tự động vào các ngày cuối tuần và ngày lễ
+        # Bỏ qua chạy tự động vào các ngày cuối tuần và ngày lễ nghỉ
         today_date: datetime = datetime.now(Config.VN_TZ)
 
         # 1. Chặn Thứ 7 và Chủ Nhật theo hàm weekday()

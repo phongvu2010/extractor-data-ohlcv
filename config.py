@@ -14,14 +14,16 @@ def _get_env_int(key: str, default: int) -> int:
     """Lấy giá trị cấu hình số nguyên từ biến môi trường.
 
     Args:
-        key: Tên biến môi trường cần lấy.
-        default: Giá trị mặc định nếu biến môi trường không tồn tại hoặc lỗi định dạng.
+        key (str): Tên biến môi trường cần lấy.
+        default (int): Giá trị mặc định nếu biến môi trường không tồn tại hoặc lỗi định dạng.
 
     Returns:
-        Giá trị số nguyên tương ứng.
+        int: Giá trị số nguyên tương ứng.
     """
     if not isinstance(default, int) or isinstance(default, bool):
-        raise TypeError(f"Default value for {key} must be an int, got {type(default).__name__}")
+        raise TypeError(
+            f"Default value for {key} must be an int, got {type(default).__name__}"
+        )
     val: str | None = os.getenv(key)
     if val is None:
         return default
@@ -34,7 +36,7 @@ def _get_env_int(key: str, default: int) -> int:
         warnings.warn(
             f"Environment variable '{key}' has value {val!r} which cannot be parsed to an int. "
             f"Using default value: {default}",
-            UserWarning
+            UserWarning,
         )
         return default
 
@@ -43,14 +45,16 @@ def _get_env_float(key: str, default: float) -> float:
     """Lấy giá trị cấu hình số thực từ biến môi trường.
 
     Args:
-        key: Tên biến môi trường cần lấy.
-        default: Giá trị mặc định nếu biến môi trường không tồn tại hoặc lỗi định dạng.
+        key (str): Tên biến môi trường cần lấy.
+        default (float): Giá trị mặc định nếu biến môi trường không tồn tại hoặc lỗi định dạng.
 
     Returns:
-        Giá trị số thực tương ứng.
+        float: Giá trị số thực tương ứng.
     """
     if not isinstance(default, (int, float)) or isinstance(default, bool):
-        raise TypeError(f"Default value for {key} must be a float or int, got {type(default).__name__}")
+        raise TypeError(
+            f"Default value for {key} must be a float or int, got {type(default).__name__}"
+        )
     val: str | None = os.getenv(key)
     if val is None:
         return float(default)
@@ -63,7 +67,7 @@ def _get_env_float(key: str, default: float) -> float:
         warnings.warn(
             f"Environment variable '{key}' has value {val!r} which cannot be parsed to a float. "
             f"Using default value: {default}",
-            UserWarning
+            UserWarning,
         )
         return float(default)
 
@@ -72,11 +76,11 @@ def _get_secret(key: str, default: str = "") -> str:
     """Lấy giá trị cấu hình bảo mật từ tệp mount của Secret Manager hoặc biến môi trường.
 
     Args:
-        key: Tên secret cần lấy.
-        default: Giá trị mặc định.
+        key (str): Tên secret cần lấy.
+        default (str): Giá trị mặc định.
 
     Returns:
-        Giá trị cấu hình chuỗi tương ứng.
+        str: Giá trị cấu hình chuỗi tương ứng.
     """
     # Cloud Run hỗ trợ mount secrets dưới dạng file tại đường dẫn /secrets/<SECRET_NAME>
     secret_path: str = f"/secrets/{key}"
@@ -84,7 +88,7 @@ def _get_secret(key: str, default: str = "") -> str:
         try:
             with open(secret_path, "r", encoding="utf-8") as f:
                 return f.read().strip()
-        except Exception:
+        except OSError:
             pass
     return os.getenv(key, default)
 
@@ -106,7 +110,7 @@ class Config:
         sử dụng cơ chế cache tránh tính toán lặp lại.
 
         Returns:
-            Danh sách các ngày nghỉ lễ được định dạng chuỗi YYYY-MM-DD.
+            list[str]: Danh sách các ngày nghỉ lễ được định dạng chuỗi YYYY-MM-DD.
         """
         current_year: int = datetime.now(cls.VN_TZ).year
         if cls._cached_year != current_year or cls._cached_holidays is None:
@@ -125,18 +129,24 @@ class Config:
                 # Chuẩn hóa dấu gạch chéo thành gạch ngang (ví dụ 2026/06/15 -> 2026-06-15)
                 d_normalized: str = d_clean.replace("/", "-")
                 try:
-                    valid_date: date = datetime.strptime(d_normalized, "%Y-%m-%d").date()
+                    valid_date: date = datetime.strptime(
+                        d_normalized, "%Y-%m-%d"
+                    ).date()
                     custom_holiday_list.append(valid_date.strftime("%Y-%m-%d"))
                 except ValueError:
                     warnings.warn(
                         f"Environment variable 'CUSTOM_HOLIDAYS' contains invalid entry {d_clean!r}. "
                         "Expected format: YYYY-MM-DD. Ignoring this entry.",
-                        UserWarning
+                        UserWarning,
                     )
 
-            cls._cached_holidays = sorted(list(
-                set([str(dt) for dt in vn_holidays_obj.keys()] + custom_holiday_list)
-            ))
+            cls._cached_holidays = sorted(
+                list(
+                    set(
+                        [str(dt) for dt in vn_holidays_obj.keys()] + custom_holiday_list
+                    )
+                )
+            )
             cls._cached_year = current_year
         return cls._cached_holidays
 
@@ -146,9 +156,13 @@ class Config:
 
     # Cấu hình Google Cloud Storage (GCS)
     GCS_BUCKET_NAME: str = os.getenv("GCS_BUCKET_NAME", "vn-stock")
-    GCS_CHECKPOINT_KEY: str = os.getenv("GCS_CHECKPOINT_KEY", "checkpoints/latest_state.json")
+    GCS_CHECKPOINT_KEY: str = os.getenv(
+        "GCS_CHECKPOINT_KEY", "checkpoints/latest_state.json"
+    )
     GCS_PARQUET_PREFIX: str = os.getenv("GCS_PARQUET_PREFIX", "market_data")
-    GCS_EXPORT_TICKERS_KEY: str = os.getenv("GCS_EXPORT_TICKERS_KEY", "config/interested_tickers.txt")
+    GCS_EXPORT_TICKERS_KEY: str = os.getenv(
+        "GCS_EXPORT_TICKERS_KEY", "config/interested_tickers.txt"
+    )
     GCS_BLACKLIST_KEY: str = os.getenv("GCS_BLACKLIST_KEY", "config/blacklist.txt")
     GCS_EXPORT_PREFIX: str = os.getenv("GCS_EXPORT_PREFIX", "exports")
     GCS_EXPORT_YEARS: int = _get_env_int("GCS_EXPORT_YEARS", 3)
@@ -160,6 +174,10 @@ class Config:
 
     # Các hằng số hệ thống cố định
     URL_CAFEF: str = os.getenv("URL_CAFEF", "https://cafef1.mediacdn.vn/data/ami_data/")
+    URL_EVENTS: str = os.getenv(
+        "URL_EVENTS",
+        "https://iq.vietcap.com.vn/api/iq-insight-service/v1/events",
+    )
     NETWORK_TIMEOUT: int = _get_env_int("NETWORK_TIMEOUT", 30)
     PRICE_MULTIPLIER: int = _get_env_int("PRICE_MULTIPLIER", 1000)
     CHUNK_SIZE: int = _get_env_int("CHUNK_SIZE", 150000)
@@ -176,11 +194,18 @@ class Config:
     TELEGRAM_CHAT_ID: str = _get_secret("TELEGRAM_CHAT_ID", "")
 
     # Cấu hình bỏ qua các chốt chặn ngày nghỉ (cuối tuần / lễ) khi cần chạy ép buộc
-    FORCE_RUN: bool = os.getenv("FORCE_RUN", os.getenv("FORCE_RUN_WEEKEND", "false")).lower() == "true"
+    FORCE_RUN: bool = (
+        os.getenv("FORCE_RUN", os.getenv("FORCE_RUN_WEEKEND", "false")).lower()
+        == "true"
+    )
 
     @classmethod
     def validate_config(cls) -> None:
-        """Kiểm tra cấu hình hệ thống và đưa ra các cảnh báo cần thiết."""
+        """Kiểm tra cấu hình hệ thống và đưa ra các cảnh báo cần thiết.
+
+        Raises:
+            RuntimeWarning: Nếu thiếu các biến môi trường quan trọng.
+        """
         missing_critical: list[str] = []
         if cls.DEPLOYMENT_ENV == "local":
             if not cls.DATABASE_URL:
@@ -195,15 +220,17 @@ class Config:
             warnings.warn(
                 f"⚠️ [Cấu hình] Thiếu các biến môi trường quan trọng cho chế độ '{cls.DEPLOYMENT_ENV}': {', '.join(missing_critical)}. "
                 "Hệ thống có thể không hoạt động hoặc sập khi thực thi.",
-                RuntimeWarning
+                RuntimeWarning,
             )
 
         # Cảnh báo nếu cấu hình Telegram bị thiếu 1 trong 2 trường
-        if (cls.TELEGRAM_BOT_TOKEN and not cls.TELEGRAM_CHAT_ID) or (cls.TELEGRAM_CHAT_ID and not cls.TELEGRAM_BOT_TOKEN):
+        if (cls.TELEGRAM_BOT_TOKEN and not cls.TELEGRAM_CHAT_ID) or (
+            cls.TELEGRAM_CHAT_ID and not cls.TELEGRAM_BOT_TOKEN
+        ):
             warnings.warn(
                 "⚠️ [Cấu hình] Thiếu TELEGRAM_BOT_TOKEN hoặc TELEGRAM_CHAT_ID. "
                 "Hệ thống sẽ không gửi được thông báo cảnh báo qua Telegram.",
-                UserWarning
+                UserWarning,
             )
 
 
