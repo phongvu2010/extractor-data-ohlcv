@@ -136,6 +136,37 @@ class BaseStorage(ABC):
         pass
 
     @abstractmethod
+    def get_state(self, key: str) -> Any:
+        """Đọc một trạng thái tùy ý từ kho lưu trữ.
+
+        Args:
+            key (str): Khóa của trạng thái cần đọc.
+
+        Returns:
+            Any: Giá trị của trạng thái, hoặc None nếu không tồn tại.
+        """
+        pass
+
+    @abstractmethod
+    def save_state(self, key: str, value: Any) -> None:
+        """Lưu một trạng thái tùy ý vào kho lưu trữ.
+
+        Args:
+            key (str): Khóa của trạng thái cần lưu.
+            value (Any): Giá trị của trạng thái (cần tương thích JSON).
+        """
+        pass
+
+    @abstractmethod
+    def save_icb_industries(self, df_icb: pd.DataFrame) -> None:
+        """Lưu thông tin danh mục phân loại ngành ICB.
+
+        Args:
+            df_icb (pd.DataFrame): DataFrame chứa thông tin danh mục ngành ICB.
+        """
+        pass
+
+    @abstractmethod
     def save_companies(self, df_companies: pd.DataFrame) -> None:
         """Lưu thông tin danh sách các công ty.
 

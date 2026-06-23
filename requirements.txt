@@ -37,4 +37,4 @@ rich==15.0.0
 
 # Database & ORM
 SQLAlchemy==2.0.31
-psycopg2==2.9.9
+psycopg2-binary==2.9.12

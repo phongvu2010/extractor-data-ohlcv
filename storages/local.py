@@ -33,6 +33,20 @@ from .base import BaseStorage
 Base = declarative_base()
 
 
+class IcbIndustryModel(Base):
+    """Bảng danh mục ngành ICB phẳng."""
+
+    __tablename__ = "icb_industries"
+    icb_code = Column(String(10), primary_key=True)
+    icb_l1_code = Column(String(10), nullable=False)
+    icb_l1_name = Column(String(100), nullable=False)
+    icb_l2_code = Column(String(10), nullable=False)
+    icb_l2_name = Column(String(100), nullable=False)
+    icb_l3_code = Column(String(10), nullable=False)
+    icb_l3_name = Column(String(100), nullable=False)
+    icb_name = Column(String(100), nullable=False)
+
+
 class CompanyModel(Base):
     """Bảng lưu trữ thông tin các công ty niêm yết."""
 
@@ -40,7 +54,11 @@ class CompanyModel(Base):
     symbol = Column(String(10), primary_key=True)
     exchange = Column(String(10), nullable=False)
     company_name = Column(String(255), nullable=False)
-    industry = Column(String(255), nullable=False)
+    icb_code = Column(
+        String(10), ForeignKey("icb_industries.icb_code", ondelete="SET NULL"), nullable=True
+    )
+    com_type_code = Column(String(20), nullable=True)
+    type = Column(String(20), nullable=True)
     status = Column(String(50), nullable=False)
 
 
@@ -86,9 +104,9 @@ Index(
 
 
 class AdjustedPriceModel(Base):
-    """Bảng lưu trữ giá điều chỉnh (adjusted price) của các cổ phiếu (được chuyển thành Hypertable)."""
+    """Bảng lưu trữ giá điều chỉnh (adj price) của các cổ phiếu (được chuyển thành Hypertable)."""
 
-    __tablename__ = "adjusted_price"
+    __tablename__ = "adj_price"
     symbol = Column(String(10), primary_key=True)
     trading_date = Column(Date, primary_key=True)
     open_price = Column(Numeric(18, 2), nullable=False)
@@ -175,7 +193,7 @@ class LocalStorage(BaseStorage):
         self.init_db()
 
     def init_db(self) -> None:
-        """Khởi tạo cấu trúc các bảng và chuyển đổi raw_price/adjusted_price thành hypertable nếu hỗ trợ.
+        """Khởi tạo cấu trúc các bảng và chuyển đổi raw_price/adj_price thành hypertable nếu hỗ trợ.
 
         Raises:
             Exception: Phát sinh khi khởi tạo cơ sở dữ liệu gặp lỗi.
@@ -223,19 +241,73 @@ class LocalStorage(BaseStorage):
                             )
                         )
 
-                    # Kiểm tra và chuyển đổi adjusted_price thành hypertable
+                    # Thiết lập nén cho raw_price nếu chưa cấu hình
+                    res_raw_comp = conn.execute(
+                        text(
+                            "SELECT 1 FROM timescaledb_information.compression_settings WHERE hypertable_name = 'raw_price';"
+                        )
+                    ).fetchone()
+                    if not res_raw_comp:
+                        self.logger.info(
+                            "✨ [TimescaleDB] Thiết lập chính sách nén (30 ngày) cho 'raw_price'..."
+                        )
+                        conn.execute(
+                            text(
+                                """
+                                ALTER TABLE raw_price SET (
+                                    timescaledb.compress,
+                                    timescaledb.compress_segmentby = 'symbol',
+                                    timescaledb.compress_orderby = 'trading_date DESC'
+                                );
+                                """
+                            )
+                        )
+                        conn.execute(
+                            text(
+                                "SELECT add_compression_policy('raw_price', INTERVAL '30 days', if_not_exists => TRUE);"
+                            )
+                        )
+
+                    # Kiểm tra và chuyển đổi adj_price thành hypertable
                     res_adj = conn.execute(
                         text(
-                            "SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name = 'adjusted_price';"
+                            "SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name = 'adj_price';"
                         )
                     ).fetchone()
                     if not res_adj:
                         self.logger.info(
-                            "✨ [TimescaleDB] Chuyển đổi 'adjusted_price' sang Hypertable..."
+                            "✨ [TimescaleDB] Chuyển đổi 'adj_price' sang Hypertable..."
                         )
                         conn.execute(
                             text(
-                                "SELECT create_hypertable('adjusted_price', 'trading_date');"
+                                "SELECT create_hypertable('adj_price', 'trading_date');"
+                            )
+                        )
+
+                    # Thiết lập nén cho adj_price nếu chưa cấu hình
+                    res_adj_comp = conn.execute(
+                        text(
+                            "SELECT 1 FROM timescaledb_information.compression_settings WHERE hypertable_name = 'adj_price';"
+                        )
+                    ).fetchone()
+                    if not res_adj_comp:
+                        self.logger.info(
+                            "✨ [TimescaleDB] Thiết lập chính sách nén (30 ngày) cho 'adj_price'..."
+                        )
+                        conn.execute(
+                            text(
+                                """
+                                ALTER TABLE adj_price SET (
+                                    timescaledb.compress,
+                                    timescaledb.compress_segmentby = 'symbol',
+                                    timescaledb.compress_orderby = 'trading_date DESC'
+                                );
+                                """
+                            )
+                        )
+                        conn.execute(
+                            text(
+                                "SELECT add_compression_policy('adj_price', INTERVAL '30 days', if_not_exists => TRUE);"
                             )
                         )
                 else:
@@ -554,21 +626,21 @@ class LocalStorage(BaseStorage):
             try:
                 with self.engine.begin() as conn:
                     # 1. Xóa dữ liệu cũ ngày hôm đó
-                    delete_query: str = "DELETE FROM adjusted_price WHERE trading_date IN (:dates)"
+                    delete_query: str = "DELETE FROM adj_price WHERE trading_date IN (:dates)"
                     params: dict[str, Any] = {"dates": chunk_dates}
 
                     if excluded_symbols:
                         delete_query = (
-                            "DELETE FROM adjusted_price WHERE trading_date IN (:dates) "
+                            "DELETE FROM adj_price WHERE trading_date IN (:dates) "
                             "AND symbol NOT IN (:excluded_symbols)"
                         )
                         params["excluded_symbols"] = [
                             s.upper() for s in excluded_symbols
                         ]
 
-                    # 2. Sao chép từ raw_price sang adjusted_price
+                    # 2. Sao chép từ raw_price sang adj_price
                     insert_query: str = """
-                        INSERT INTO adjusted_price (
+                        INSERT INTO adj_price (
                             symbol, trading_date, open_price, high_price,
                             low_price, close_price, total_volume, exchange, source
                         )
@@ -580,7 +652,7 @@ class LocalStorage(BaseStorage):
                     """
                     if excluded_symbols:
                         insert_query = """
-                            INSERT INTO adjusted_price (
+                            INSERT INTO adj_price (
                                 symbol, trading_date, open_price, high_price,
                                 low_price, close_price, total_volume, exchange,
                                 source
@@ -614,7 +686,7 @@ class LocalStorage(BaseStorage):
                     conn.execute(insert_stmt, params)
             except Exception as e:
                 self.logger.error(
-                    f"❌ [Postgres] Lỗi đồng bộ adjusted_price ở lô {i // chunk_size + 1}: {e}"
+                    f"❌ [Postgres] Lỗi đồng bộ adj_price ở lô {i // chunk_size + 1}: {e}"
                 )
                 raise e
 
@@ -622,6 +694,43 @@ class LocalStorage(BaseStorage):
             f"🎉 [Postgres] Hoàn tất sao chép từ raw sang adjusted "
             f"cho {len(date_strings)} ngày."
         )
+
+    def get_state(self, key: str) -> Any:
+        """Đọc một trạng thái tùy ý từ bảng pipeline_state.
+
+        Args:
+            key (str): Khóa của trạng thái cần đọc.
+
+        Returns:
+            Any: Giá trị của trạng thái (JSON), hoặc None nếu không tồn tại.
+        """
+        try:
+            with self.Session() as session:
+                row = session.query(PipelineStateModel).filter_by(key=key).first()
+                return row.value if row else None
+        except Exception as e:
+            self.logger.warning(f"⚠️ [Postgres] Không thể đọc trạng thái '{key}': {e}")
+            return None
+
+    def save_state(self, key: str, value: Any) -> None:
+        """Lưu một trạng thái tùy ý vào bảng pipeline_state.
+
+        Args:
+            key (str): Khóa của trạng thái cần lưu.
+            value (Any): Giá trị của trạng thái (cần tương thích JSON).
+        """
+        try:
+            with self.Session() as session:
+                row = session.query(PipelineStateModel).filter_by(key=key).first()
+                if not row:
+                    row = PipelineStateModel(key=key, value=value)
+                    session.add(row)
+                else:
+                    row.value = value
+                session.commit()
+        except Exception as e:
+            self.logger.error(f"❌ [Postgres] Không thể lưu trạng thái '{key}': {e}")
+            raise e
 
     def read_checkpoint(self) -> dict[str, Any]:
         """Đọc tệp checkpoint EOD từ bảng pipeline_state.
@@ -876,6 +985,35 @@ class LocalStorage(BaseStorage):
             self.logger.error(
                 f"❌ [Postgres] Gặp lỗi khi lưu sự kiện doanh nghiệp: {e}"
             )
+            raise e
+
+    def save_icb_industries(self, df_icb: pd.DataFrame) -> None:
+        """Lưu danh mục ngành ICB vào PostgreSQL.
+
+        Args:
+            df_icb (pd.DataFrame): DataFrame chứa thông tin danh mục phân loại ngành ICB.
+
+        Raises:
+            Exception: Lỗi phát sinh khi thực hiện chèn/cập nhật thông tin vào cơ sở dữ liệu.
+        """
+        if df_icb is None or df_icb.empty:
+            return
+        self.logger.info(
+            f"💾 [Postgres] Đang lưu {len(df_icb)} ngành ICB..."
+        )
+        try:
+            upsert_method = self._create_upsert_method(["icb_code"])
+            df_icb.to_sql(
+                name="icb_industries",
+                con=self.engine,
+                if_exists="append",
+                index=False,
+                method=upsert_method,
+                chunksize=5000,
+            )
+            self.logger.info("🎉 [Postgres] Lưu danh mục ngành ICB thành công.")
+        except Exception as e:
+            self.logger.error(f"❌ [Postgres] Gặp lỗi khi lưu danh mục ngành ICB: {e}")
             raise e
 
     def save_companies(self, df_companies: pd.DataFrame) -> None:

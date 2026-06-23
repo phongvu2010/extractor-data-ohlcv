@@ -30,16 +30,23 @@ Hệ thống bao gồm hai pipeline chính:
 ## 📂 Cấu trúc Dự án
 
 ```text
+├── config/
+│   ├── blacklist.txt           # Danh sách các mã rác/mã ảo cần bỏ qua
+│   └── interested_tickers.txt  # Danh sách các mã quan tâm cần xuất dữ liệu
 ├── extractors/
 │   ├── __init__.py
 │   ├── extractor_cafef.py      # Bộ trích xuất lịch sử CafeF
 │   └── extractor_vnstock.py    # Bộ cập nhật hàng ngày & bù ngày thiếu Vnstock
 ├── secrets/
 │   └── credentials.json        # Google Service Account Credentials (chỉ dùng nội bộ/local)
+├── storages/
+│   ├── __init__.py             # Factory Method khởi tạo bộ lưu trữ
+│   ├── base.py                 # Định nghĩa lớp cơ sở trừu tượng
+│   ├── cloud.py                # Bộ lưu trữ lên GCS & BigQuery
+│   └── local.py                # Bộ lưu trữ lên PostgreSQL & TimescaleDB
 ├── scratch/                    # Thư mục chứa các tệp nháp thử nghiệm
 ├── .env                        # Chứa cấu hình môi trường thực tế (không đẩy lên git)
 ├── .env.example                # File mẫu cấu hình môi trường
-├── blacklist.txt               # Danh sách các mã rác/mã ảo cần bỏ qua
 ├── config.py                   # Quản lý tập trung các cấu hình và hằng số
 ├── Dockerfile                  # Cấu hình đóng gói Container Docker
 ├── docker-compose.yml          # Quản lý chạy container
@@ -47,7 +54,6 @@ Hệ thống bao gồm hai pipeline chính:
 ├── main_cafef.ipynb            # Jupyter Notebook chạy khởi tạo lịch sử
 ├── notifier.py                 # Module cảnh báo qua Telegram Bot
 ├── requirements.txt            # Danh sách thư viện Python cần thiết
-├── storages.py                 # Module tương tác chính với GCP (GCS & BigQuery)
 └── utils.py                    # Tiện ích chung & bộ giới hạn tốc độ API
 ```
 

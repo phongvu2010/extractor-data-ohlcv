@@ -95,20 +95,22 @@ class CloudStorage(BaseStorage):
         except Exception:
             return
 
-        prefix: str = f"{Config.BQ_ADJ_TABLE}_staging_"
+        prefix_raw: str = f"{Config.BQ_RAW_TABLE}_staging_"
+        prefix_adj: str = f"{Config.BQ_ADJ_TABLE}_staging_"
         self.logger.info(
-            f"🧹 [BigQuery] Đang quét các bảng staging còn sót lại với tiền tố '{prefix}' bằng metadata query..."
+            f"🧹 [BigQuery] Đang quét các bảng staging còn sót lại với tiền tố '{prefix_raw}' và '{prefix_adj}'..."
         )
 
         try:
             query: str = f"""
                 SELECT table_name
                 FROM `{self.bq_client.project}.{Config.BQ_DATASET}.INFORMATION_SCHEMA.TABLES`
-                WHERE table_name LIKE @prefix
+                WHERE table_name LIKE @prefix_raw OR table_name LIKE @prefix_adj
             """
             query_config: bigquery.QueryJobConfig = bigquery.QueryJobConfig(
                 query_parameters=[
-                    bigquery.ScalarQueryParameter("prefix", "STRING", f"{prefix}%"),
+                    bigquery.ScalarQueryParameter("prefix_raw", "STRING", f"{prefix_raw}%"),
+                    bigquery.ScalarQueryParameter("prefix_adj", "STRING", f"{prefix_adj}%"),
                 ]
             )
             query_job: bigquery.QueryJob = self.bq_client.query(
@@ -1304,6 +1306,22 @@ class CloudStorage(BaseStorage):
 
         Args:
             events (list[dict[str, Any]]): Danh sách các sự kiện doanh nghiệp.
+        """
+        pass
+
+    def get_state(self, key: str) -> Any:
+        """Đọc trạng thái (Không thực hiện ở phiên bản CloudStorage)."""
+        return None
+
+    def save_state(self, key: str, value: Any) -> None:
+        """Lưu trạng thái (Không thực hiện ở phiên bản CloudStorage)."""
+        pass
+
+    def save_icb_industries(self, df_icb: pd.DataFrame) -> None:
+        """Ghi nhận danh mục ngành ICB (Không thực hiện ở phiên bản CloudStorage).
+
+        Args:
+            df_icb (pd.DataFrame): DataFrame chứa thông tin danh mục phân loại ngành ICB.
         """
         pass
 

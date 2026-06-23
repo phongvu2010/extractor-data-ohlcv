@@ -800,47 +800,122 @@ class VnstockExtractorETL:
         """
         symbols_map: dict[str, str] = self.processor.get_symbols_with_exchange()
 
-        # Đồng bộ danh sách công ty từ vnstock vào DB (chỉ áp dụng ở môi trường hỗ trợ lưu trữ thông tin công ty)
-        try:
-            self.logger.info("🏢 Bắt đầu cào danh sách công ty từ vnstock...")
-            df_symbols = self.processor.reference_api.equity().list_by_exchange()
-            df_symbols = df_symbols[
-                ~df_symbols["type"].isin(["corpbond", "bond", "future"])
-            ]
+        # Đồng bộ danh sách công ty từ vnstock vào DB (chỉ áp dụng ở môi trường hỗ trợ lưu trữ thông tin công ty - Local)
+        if Config.DEPLOYMENT_ENV == "local":
+            # Kiểm tra xem có cần đồng bộ danh sách công ty & ngành hay không (tối thiểu 7 ngày/lần)
+            last_sync_str = self.storage.get_state("last_company_sync_date")
+            should_sync = True
+            today_date = datetime.now(Config.VN_TZ).date()
+            if last_sync_str:
+                try:
+                    last_sync_date = datetime.strptime(last_sync_str, "%Y-%m-%d").date()
+                    if (today_date - last_sync_date).days < 7:
+                        should_sync = False
+                        self.logger.info(
+                            f"ℹ️ Danh sách công ty & ngành đã được đồng bộ vào {last_sync_str} (dưới 7 ngày trước). Bỏ qua đồng bộ hôm nay."
+                        )
+                except Exception as e:
+                    self.logger.warning(
+                        f"⚠️ Không thể phân tích ngày đồng bộ công ty cuối cùng {last_sync_str}: {e}"
+                    )
 
-            # Tải danh sách ngành từ vnstock
-            df_industry = self.processor.reference_api.equity().list_by_industry()
-            df_ind_level = df_industry[df_industry["icb_level"] == 4]
-            if df_ind_level.empty:
-                df_ind_level = df_industry[df_industry["icb_level"] == 3]
-            if df_ind_level.empty:
-                df_ind_level = df_industry[df_industry["icb_level"] == 1]
+            if should_sync:
+                try:
+                    self.logger.info("🏢 Bắt đầu cào danh sách công ty từ vnstock...")
+                    df_symbols = self.processor.reference_api.equity().list_by_exchange()
+                    df_symbols = df_symbols[
+                        ~df_symbols["type"].isin(["corpbond", "bond", "future"])
+                    ]
 
-            df_merged = pd.merge(
-                df_symbols,
-                df_ind_level[["symbol", "icb_name"]],
-                on="symbol",
-                how="left",
-            )
-            df_companies = pd.DataFrame(
-                {
-                    "symbol": df_merged["symbol"].str.strip().str.upper(),
-                    "exchange": df_merged["exchange"].apply(normalize_exchange),
-                    "company_name": df_merged["organ_name"]
-                    .str.strip()
-                    .fillna("Unknown"),
-                    "industry": df_merged["icb_name"].str.strip().fillna("Unknown"),
-                    "status": "active",
-                }
-            )
-            df_companies.drop_duplicates(subset=["symbol"], inplace=True)
-            self.storage.save_companies(df_companies)
+                    # Tải danh sách ngành từ vnstock
+                    df_industry = self.processor.reference_api.equity().list_by_industry()
+
+                    # Phân tách 4 cấp độ ngành dựa trên symbol
+                    df_l1 = df_industry[df_industry["icb_level"] == 1][["symbol", "icb_code", "icb_name"]].rename(
+                        columns={"icb_code": "icb_l1_code", "icb_name": "icb_l1_name"}
+                    )
+                    df_l2 = df_industry[df_industry["icb_level"] == 2][["symbol", "icb_code", "icb_name"]].rename(
+                        columns={"icb_code": "icb_l2_code", "icb_name": "icb_l2_name"}
+                    )
+                    df_l3 = df_industry[df_industry["icb_level"] == 3][["symbol", "icb_code", "icb_name"]].rename(
+                        columns={"icb_code": "icb_l3_code", "icb_name": "icb_l3_name"}
+                    )
+                    df_l4 = df_industry[df_industry["icb_level"] == 4][["symbol", "icb_code", "icb_name"]].rename(
+                        columns={"icb_code": "icb_code", "icb_name": "icb_name"}
+                    )
+
+                    # Xác định cấp độ lá (leaf level) thực tế cho mỗi symbol (max icb_level)
+                    idx_max = df_industry.groupby("symbol")["icb_level"].idxmax()
+                    if "com_type_code" in df_industry.columns:
+                        df_leaf = df_industry.loc[idx_max][["symbol", "icb_code", "icb_level", "com_type_code"]]
+                    else:
+                        df_leaf = df_industry.loc[idx_max][["symbol", "icb_code", "icb_level"]].copy()
+                        df_leaf["com_type_code"] = None
+
+                    # Xây dựng bảng phẳng danh mục ngành icb_industries
+                    df_paths = df_leaf.rename(columns={"icb_code": "icb_code_leaf"})
+                    df_paths = pd.merge(df_paths, df_l1, on="symbol", how="left")
+                    df_paths = pd.merge(df_paths, df_l2, on="symbol", how="left")
+                    df_paths = pd.merge(df_paths, df_l3, on="symbol", how="left")
+                    df_paths = pd.merge(df_paths, df_l4, on="symbol", how="left")
+
+                    # Chuẩn bị DataFrame icb_industries
+                    df_icb_industries = df_paths[[
+                        "icb_code_leaf",
+                        "icb_l1_code", "icb_l1_name",
+                        "icb_l2_code", "icb_l2_name",
+                        "icb_l3_code", "icb_l3_name",
+                        "icb_name"
+                    ]].copy()
+                    df_icb_industries.rename(columns={"icb_code_leaf": "icb_code"}, inplace=True)
+
+                    # Điền các giá trị thiếu (NaN) với giá trị hợp lý
+                    df_icb_industries["icb_l1_code"] = df_icb_industries["icb_l1_code"].fillna("Unknown")
+                    df_icb_industries["icb_l1_name"] = df_icb_industries["icb_l1_name"].fillna("Unknown")
+                    df_icb_industries["icb_l2_code"] = df_icb_industries["icb_l2_code"].fillna("Unknown")
+                    df_icb_industries["icb_l2_name"] = df_icb_industries["icb_l2_name"].fillna("Unknown")
+                    df_icb_industries["icb_l3_code"] = df_icb_industries["icb_l3_code"].fillna("Unknown")
+                    df_icb_industries["icb_l3_name"] = df_icb_industries["icb_l3_name"].fillna("Unknown")
+                    df_icb_industries["icb_name"] = df_icb_industries["icb_name"].fillna(df_icb_industries["icb_l3_name"])
+
+                    df_icb_industries.drop_duplicates(subset=["icb_code"], inplace=True)
+
+                    # Lưu danh mục ngành ICB vào database trước
+                    self.storage.save_icb_industries(df_icb_industries)
+
+                    # Merge với danh sách cổ phiếu
+                    df_merged = pd.merge(
+                        df_symbols,
+                        df_leaf[["symbol", "icb_code", "com_type_code"]],
+                        on="symbol",
+                        how="left",
+                    )
+                    df_companies = pd.DataFrame(
+                        {
+                            "symbol": df_merged["symbol"].str.strip().str.upper(),
+                            "exchange": df_merged["exchange"].apply(normalize_exchange),
+                            "company_name": df_merged["organ_name"].str.strip().fillna("Unknown"),
+                            "icb_code": df_merged["icb_code"].where(df_merged["icb_code"].notna(), None),
+                            "com_type_code": df_merged["com_type_code"].where(df_merged["com_type_code"].notna(), None),
+                            "type": df_merged["type"].where(df_merged["type"].notna(), None),
+                            "status": "active",
+                        }
+                    )
+                    df_companies.drop_duplicates(subset=["symbol"], inplace=True)
+                    self.storage.save_companies(df_companies)
+                    self.logger.info(
+                        f"✅ Đã cào và đồng bộ {len(df_companies)} công ty vào database."
+                    )
+
+                    # Cập nhật ngày đồng bộ thành công vào DB
+                    self.storage.save_state("last_company_sync_date", today_date.strftime("%Y-%m-%d"))
+                except Exception as e:
+                    self.logger.error(
+                        f"❌ Lỗi khi đồng bộ danh sách công ty: {e}", exc_info=True
+                    )
+        else:
             self.logger.info(
-                f"✅ Đã cào và đồng bộ {len(df_companies)} công ty vào database."
-            )
-        except Exception as e:
-            self.logger.error(
-                f"❌ Lỗi khi đồng bộ danh sách công ty: {e}", exc_info=True
+                "☁️ Đang chạy ở chế độ Cloud - Bỏ qua việc cào danh sách công ty và phân loại ngành ICB."
             )
 
         t0_multiplier: float = self.verify_price_units(symbols_map)
