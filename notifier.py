@@ -5,7 +5,6 @@ from __future__ import annotations
 from datetime import datetime
 import html
 import logging
-import time
 from typing import Any
 
 import requests

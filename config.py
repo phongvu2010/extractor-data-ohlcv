@@ -211,9 +211,6 @@ class Config:
         if t.strip()
     ]
 
-    # Cấu hình chu kỳ đồng bộ thông tin công ty và ngành ICB (ngày)
-    COMPANY_SYNC_INTERVAL_DAYS: int = _get_env_int("COMPANY_SYNC_INTERVAL_DAYS", 7)
-
     # Cấu hình kích thước lô (batch size) khi tải bảng giá T0 và reload giá điều chỉnh
     PRICE_BOARD_BATCH_SIZE: int = _get_env_int("PRICE_BOARD_BATCH_SIZE", 500)
     RELOAD_BATCH_SIZE: int = _get_env_int("RELOAD_BATCH_SIZE", 10)

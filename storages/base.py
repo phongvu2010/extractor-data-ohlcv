@@ -128,14 +128,6 @@ class BaseStorage(ABC):
         """
         pass
 
-    @abstractmethod
-    def save_corporate_events(self, events: list[dict[str, Any]]) -> None:
-        """Lưu danh sách chi tiết sự kiện doanh nghiệp.
-
-        Args:
-            events (list[dict[str, Any]]): Danh sách các dict chi tiết sự kiện doanh nghiệp.
-        """
-        pass
 
     @abstractmethod
     def get_state(self, key: str) -> Any:
@@ -159,23 +151,6 @@ class BaseStorage(ABC):
         """
         pass
 
-    @abstractmethod
-    def save_icb_industries(self, df_icb: pl.DataFrame) -> None:
-        """Lưu thông tin danh mục phân loại ngành ICB.
-
-        Args:
-            df_icb (pl.DataFrame): DataFrame chứa thông tin danh mục ngành ICB.
-        """
-        pass
-
-    @abstractmethod
-    def save_companies(self, df_companies: pl.DataFrame) -> None:
-        """Lưu thông tin danh sách các công ty.
-
-        Args:
-            df_companies (pl.DataFrame): DataFrame chứa danh sách các công ty.
-        """
-        pass
 
     @abstractmethod
     def load_parquet_to_bigquery(

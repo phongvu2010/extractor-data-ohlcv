@@ -1,6 +1,6 @@
 # Vietnam Stock OHLCV Data Extractor Pipeline
 
-Hệ thống ETL tối ưu hóa thu thập dữ liệu giao dịch chứng khoán Việt Nam (Giá Thô & Giá Điều chỉnh - OHLCV) tự động chạy định kỳ, đồng bộ hóa danh mục phân cấp ngành ICB, tự động kiểm định đơn vị giá và xuất Feature Store phục vụ mô hình Machine Learning. Hệ thống hỗ trợ lưu trữ đa môi trường: Local (PostgreSQL & TimescaleDB) hoặc Cloud (Google Cloud Storage & BigQuery).
+Hệ thống ETL tối ưu hóa thu thập dữ liệu giao dịch chứng khoán Việt Nam (Giá Thô & Giá Điều chỉnh - OHLCV) tự động chạy định kỳ, tự động kiểm định đơn vị giá và xuất Feature Store phục vụ mô hình Machine Learning. Hệ thống hỗ trợ lưu trữ đa môi trường: Local (PostgreSQL & TimescaleDB) hoặc Cloud (Google Cloud Storage & BigQuery).
 
 Hệ thống bao gồm hai luồng pipeline chính:
 1.  **Pipeline CafeF (Khởi tạo lịch sử)**: Tải và nạp toàn bộ dữ liệu lịch sử thô và điều chỉnh của toàn bộ thị trường (HOSE, HNX, UPCOM) từ năm 2000 đến nay.
@@ -16,7 +16,6 @@ Hệ thống bao gồm hai luồng pipeline chính:
 *   **Khôi phục danh sách mã tự động (Fallback Cache)**: Nếu API lấy danh sách mã của Vnstock gặp sự cố, hệ thống tự động tải lại danh sách gần nhất được lưu trong Checkpoint Snapshot (`active_symbols_cache`) để đảm bảo pipeline chính tiếp tục vận hành.
 *   **Quét sự kiện doanh nghiệp an toàn (Soft Fault-Tolerance)**: Tự động quét sự kiện chia cổ tức/cổ phiếu thưởng T0 qua API Vietcap. Khối quét được bọc an toàn; nếu API Vietcap sập, hệ thống gửi cảnh báo qua Telegram nhưng vẫn tiếp tục cập nhật bảng giá T0 bình thường thay vì crash đột ngột.
 *   **Đồng bộ đơn vị giá tự động (Price Unit Check)**: Tự động đối chiếu đơn vị giá bảng điện tử T0 và dữ liệu lịch sử OHLCV qua cổ phiếu benchmark (mặc định: FPT). Hệ thống tự động nhân hệ số 1000.0 nếu phát hiện lệch đơn vị (giá bảng điện tử tính theo nghìn đồng, OHLCV tính theo đồng).
-*   **Đồng bộ cơ cấu ngành ICB phẳng**: Tự động đồng bộ thông tin công ty và cấu trúc ngành ICB (phân tách chuẩn 4 cấp độ ngành ICB) vào cơ sở dữ liệu theo chu kỳ cấu hình (`COMPANY_SYNC_INTERVAL_DAYS`).
 *   **Cảnh báo Telegram & Đồng bộ Logger**:
     *   Hệ thống logger được chuẩn hóa cấu trúc tiền tố rõ ràng như `[Vnstock]`, `[Events]`, `[Backfill]`, `[Unit Check]`, `[GCS]`, `[BigQuery]`, `📲 [Telegram]`.
     *   Báo cáo tổng hợp tiến độ chạy daily hoặc gửi cảnh báo lỗi khẩn cấp trực quan qua Telegram Bot API.
@@ -35,8 +34,7 @@ Hệ thống bao gồm hai luồng pipeline chính:
 
 ```text
 ├── configs/
-│   ├── blacklist.txt           # Danh sách các mã rác/mã ảo cần bỏ qua
-│   └── interested_tickers.txt  # Danh sách các mã quan tâm cần xuất dữ liệu
+│   └── blacklist.txt           # Danh sách các mã rác/mã ảo cần bỏ qua
 ├── extractors/
 │   ├── __init__.py
 │   ├── extractor_cafef.py      # Bộ trích xuất lịch sử CafeF

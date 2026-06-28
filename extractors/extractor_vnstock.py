@@ -12,7 +12,7 @@ from typing import Any
 import pandera.errors as pa_errors
 import polars as pl
 import requests
-from vnstock import Reference, Trading
+from vnstock import Trading
 from vnstock.core.utils.user_agent import get_headers
 from vnstock.ui import Market
 
@@ -28,16 +28,12 @@ from utils import (
     build_price_invalid_mask,
 )
 
-# Suppress spam logging from vnstock internal company explorer module
-logging.getLogger("vnstock.explorer.vci.company").setLevel(logging.CRITICAL)
-
 
 class DataProcessor:
     """Chuyên trách việc làm sạch, biến đổi và tối ưu hóa dữ liệu chứng khoán từ vnstock."""
 
     logger: logging.Logger
     source: str
-    reference_api: Reference
     trading_api: Trading
     market_api: Market
     rate_limiter: SmartRateLimiter
@@ -52,7 +48,6 @@ class DataProcessor:
         self.logger = logger
         self.source = source or Config.VNSTOCK_DEFAULT_SOURCE
 
-        self.reference_api = Reference()
         self.trading_api = Trading()
         self.market_api = Market()
 
@@ -859,168 +854,6 @@ class VnstockExtractorETL:
             # Cập nhật cache mới nhất vào storage
             self.storage.save_state("active_symbols_cache", symbols_map)
 
-        # Đồng bộ danh sách công ty từ vnstock vào DB (áp dụng ở cả Cloud và Local)
-        # Kiểm tra xem có cần đồng bộ danh sách công ty & ngành hay không (tối thiểu 7 ngày/lần)
-        last_sync_str = self.storage.get_state("last_company_sync_date")
-        should_sync = True
-        today_date = datetime.now(Config.VN_TZ).date()
-        if last_sync_str:
-            try:
-                last_sync_date = datetime.strptime(last_sync_str, "%Y-%m-%d").date()
-                if (
-                    today_date - last_sync_date
-                ).days < Config.COMPANY_SYNC_INTERVAL_DAYS:
-                    should_sync = False
-                    self.logger.info(
-                        f"ℹ️ Danh sách công ty & ngành đã được đồng bộ vào {last_sync_str} (dưới {Config.COMPANY_SYNC_INTERVAL_DAYS} ngày trước). Bỏ qua đồng bộ hôm nay."
-                    )
-            except Exception as e:
-                self.logger.warning(
-                    f"⚠️ [Vnstock] Không thể phân tích ngày đồng bộ công ty cuối cùng {last_sync_str}: {e}"
-                )
-
-        if should_sync:
-            try:
-                self.logger.info("🏢 [Vnstock] Bắt đầu cào danh sách công ty...")
-                df_symbols: pl.DataFrame = pl.from_pandas(
-                    self.processor.reference_api.equity().list_by_exchange()
-                ).filter(~pl.col("type").is_in(["corpbond", "bond", "future"]))
-
-                # Tải danh sách ngành tổng hợp từ vnstock
-                df_industry: pl.DataFrame = pl.from_pandas(
-                    self.processor.reference_api.equity().list_by_industry()
-                )
-
-                # -----------------------------------------------------------------
-                # KHỐI REFACTOR CHUẨN HÓA DANH MỤC NGÀNH ICB (Dựa trên icb_code)
-                # -----------------------------------------------------------------
-                # Bước 1: Tạo bảng tra cứu từ icb_code sang icb_name sạch sẽ, không trùng lặp
-                icb_lookup: pl.DataFrame = df_industry.select(
-                    ["icb_code", "icb_name"]
-                ).unique(subset=["icb_code"], keep="first")
-                icb_lookup_dict: dict[str, str] = dict(
-                    zip(
-                        icb_lookup["icb_code"].to_list(),
-                        icb_lookup["icb_name"].to_list(),
-                    )
-                )
-
-                # Bước 2: Xác định cấp độ lá (leaf level - icb_level lớn nhất) cho mỗi symbol
-                # Polars: sort theo icb_level desc rồi lấy first row mỗi nhóm symbol
-                leaf_cols = ["symbol", "icb_code", "icb_level"]
-                if "com_type_code" in df_industry.columns:
-                    leaf_cols.append("com_type_code")
-
-                df_leaf: pl.DataFrame = (
-                    df_industry.select(leaf_cols)
-                    .sort("icb_level", descending=True)
-                    .unique(subset=["symbol"], keep="first")
-                    .rename({"icb_code": "icb_code_leaf"})
-                )
-
-                if "com_type_code" not in df_leaf.columns:
-                    df_leaf = df_leaf.with_columns(
-                        pl.lit(None).cast(pl.Utf8).alias("com_type_code")
-                    )
-
-                # Bước 3: Phân rã mã ngành từ mã lá dựa trên độ dài chuỗi quy chuẩn ICB kinh điển
-                # (Cấp 1: 2 ký tự | Cấp 2: 4 ký tự | Cấp 3: 6 ký tự | Cấp 4: 8+ ký tự)
-                # Kỹ thuật vector hóa này giúp tránh việc merge lặp lại qua symbol
-                df_leaf = df_leaf.with_columns(
-                    pl.col("icb_code_leaf")
-                    .cast(pl.Utf8)
-                    .str.strip_chars()
-                    .alias("icb_code_leaf")
-                ).with_columns(
-                    # Cấp 1: Chữ số đầu tiên + "000". Nếu bắt đầu bằng "0" thì trả về "0001" (Dầu khí)
-                    pl.when(pl.col("icb_code_leaf").str.starts_with("0"))
-                    .then(pl.lit("0001"))
-                    .otherwise(pl.col("icb_code_leaf").str.slice(0, 1) + "000")
-                    .alias("icb_l1_code"),
-                    # Cấp 2: 2 chữ số đầu + "00"
-                    (pl.col("icb_code_leaf").str.slice(0, 2) + "00").alias(
-                        "icb_l2_code"
-                    ),
-                    # Cấp 3: 3 chữ số đầu + "0"
-                    (pl.col("icb_code_leaf").str.slice(0, 3) + "0").alias(
-                        "icb_l3_code"
-                    ),
-                    # Cấp 4 (Lá)
-                    pl.col("icb_code_leaf").alias("icb_code"),
-                )
-
-                # Bước 4: Ánh xạ tên ngành (icb_name) từ bảng tra cứu từ điển (Cực nhanh và không rò rỉ RAM)
-                df_leaf = df_leaf.with_columns(
-                    pl.col("icb_l1_code")
-                    .replace(icb_lookup_dict, default="Unknown")
-                    .alias("icb_l1_name"),
-                    pl.col("icb_l2_code")
-                    .replace(icb_lookup_dict, default="Unknown")
-                    .alias("icb_l2_name"),
-                    pl.col("icb_l3_code")
-                    .replace(icb_lookup_dict, default="Unknown")
-                    .alias("icb_l3_name"),
-                    pl.col("icb_code")
-                    .replace(icb_lookup_dict, default="Unknown")
-                    .alias("icb_name"),
-                )
-
-                # Bước 5: Tạo bảng phẳng icb_industries duy nhất để lưu danh mục gốc
-                df_icb_industries: pl.DataFrame = df_leaf.select(
-                    [
-                        "icb_code",
-                        "icb_l1_code",
-                        "icb_l1_name",
-                        "icb_l2_code",
-                        "icb_l2_name",
-                        "icb_l3_code",
-                        "icb_l3_name",
-                        "icb_name",
-                    ]
-                ).unique(subset=["icb_code"], keep="first")
-
-                # Lưu danh mục ngành ICB phẳng vào database trước
-                self.storage.save_icb_industries(df_icb_industries)
-
-                # Bước 6: Tiến hành Merge danh mục ngành lá vào danh sách cổ phiếu symbols gốc
-                df_merged: pl.DataFrame = df_symbols.join(
-                    df_leaf.select(["symbol", "icb_code", "com_type_code"]),
-                    on="symbol",
-                    how="left",
-                )
-
-                df_companies: pl.DataFrame = df_merged.select(
-                    [
-                        pl.col("symbol")
-                        .str.strip_chars()
-                        .str.to_uppercase()
-                        .alias("symbol"),
-                        get_exchange_normalization_expr("exchange"),
-                        pl.col("organ_name")
-                        .str.strip_chars()
-                        .fill_null("Unknown")
-                        .alias("company_name"),
-                        pl.col("icb_code"),
-                        pl.col("com_type_code"),
-                        pl.col("type"),
-                        pl.lit("active").alias("status"),
-                    ]
-                ).unique(subset=["symbol"], keep="first")
-                self.storage.save_companies(df_companies)
-                self.logger.info(
-                    f"✅ [Vnstock] Đã đồng bộ {df_companies.height} công ty và ngành ICB vào database."
-                )
-
-                # Cập nhật ngày đồng bộ thành công vào DB
-                self.storage.save_state(
-                    "last_company_sync_date", today_date.strftime("%Y-%m-%d")
-                )
-            except Exception as e:
-                self.logger.error(
-                    f"❌ [Vnstock] Lỗi khi đồng bộ danh sách công ty và phân cấp ICB: {e}",
-                    exc_info=True,
-                )
-
         board_mult, ohlcv_mult = self.verify_price_units(symbols_map)
         self.processor.board_multiplier = board_mult
         self.processor.ohlcv_multiplier = ohlcv_mult
@@ -1092,7 +925,6 @@ class VnstockExtractorETL:
                         symbols, backfill_start, backfill_end
                     )
                 )
-                self.storage.save_corporate_events(detected_backfill_events)
                 detected_backfill_map = {
                     e["symbol"]: e["ex_date"] for e in detected_backfill_events
                 }

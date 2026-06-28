@@ -38,58 +38,6 @@ from .base import BaseStorage
 class Base(DeclarativeBase):
     """Base class cho tất cả ORM models (SQLAlchemy 2.0 style)."""
 
-
-class IcbIndustryModel(Base):
-    """Bảng danh mục ngành ICB phẳng."""
-
-    __tablename__ = "icb_industries"
-    icb_code = Column(String(10), primary_key=True)
-    icb_l1_code = Column(String(10), nullable=False)
-    icb_l1_name = Column(String(100), nullable=False)
-    icb_l2_code = Column(String(10), nullable=False)
-    icb_l2_name = Column(String(100), nullable=False)
-    icb_l3_code = Column(String(10), nullable=False)
-    icb_l3_name = Column(String(100), nullable=False)
-    icb_name = Column(String(100), nullable=False)
-
-
-class CompanyModel(Base):
-    """Bảng lưu trữ thông tin các công ty niêm yết."""
-
-    __tablename__ = "companies"
-    symbol = Column(String(10), primary_key=True)
-    exchange = Column(String(10), nullable=False)
-    company_name = Column(String(255), nullable=False)
-    icb_code = Column(
-        String(10),
-        ForeignKey("icb_industries.icb_code", ondelete="SET NULL"),
-        nullable=True,
-    )
-    com_type_code = Column(String(20), nullable=True)
-    type = Column(String(20), nullable=True)
-    status = Column(String(50), nullable=False)
-
-
-class CorporateEventModel(Base):
-    """Bảng lưu trữ sự kiện doanh nghiệp (chia tách, cổ tức...)."""
-
-    __tablename__ = "corporate_events"
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    symbol = Column(
-        String(10), ForeignKey("companies.symbol", ondelete="CASCADE"), nullable=False
-    )
-    event_type = Column(String(50), nullable=False)
-    ex_date = Column(Date, nullable=False)
-    record_date = Column(Date, nullable=True)
-    ratio = Column(String(50), nullable=True)
-
-    __table_args__ = (
-        UniqueConstraint(
-            "symbol", "event_type", "ex_date", name="uq_symbol_event_exdate"
-        ),
-    )
-
-
 class RawPriceModel(Base):
     """Bảng lưu trữ giá thô (raw price) của các cổ phiếu (được chuyển thành Hypertable)."""
 
@@ -162,9 +110,6 @@ _ALLOWED_TABLE_NAMES: frozenset[str] = frozenset(
     {
         "raw_price",
         "adj_price",
-        "corporate_events",
-        "icb_industries",
-        "companies",
         "pipeline_state",
     }
 )
@@ -950,89 +895,6 @@ class LocalStorage(BaseStorage):
                 "cục bộ. Bỏ qua bộ lọc blacklist."
             )
             return set()
-
-    def save_corporate_events(self, events: list[dict[str, Any]]) -> None:
-        """Lưu danh sách chi tiết sự kiện doanh nghiệp vào PostgreSQL.
-
-        Args:
-            events (list[dict[str, Any]]): Danh sách các sự kiện doanh nghiệp dưới dạng dict.
-
-        Raises:
-            Exception: Lỗi phát sinh trong quá trình chuyển đổi kiểu dữ liệu hoặc ghi DB.
-        """
-        if not events:
-            return
-        self.logger.info(
-            f"💾 [Postgres] Đang lưu {len(events)} sự kiện doanh nghiệp..."
-        )
-        try:
-            df = pl.DataFrame(events)
-
-            # Ép kiểu ex_date và record_date về date
-            if "ex_date" in df.columns:
-                df = df.with_columns(pl.col("ex_date").cast(pl.Date))
-            if "record_date" in df.columns:
-                df = df.with_columns(pl.col("record_date").cast(pl.Date))
-
-            self._upsert_polars_to_pg(
-                df=df,
-                table_name="corporate_events",
-                index_elements=["symbol", "event_type", "ex_date"],
-            )
-            self.logger.info("🎉 [Postgres] Lưu sự kiện doanh nghiệp thành công.")
-        except Exception as e:
-            self.logger.error(
-                f"❌ [Postgres] Gặp lỗi khi lưu sự kiện doanh nghiệp: {e}"
-            )
-            raise e
-
-    def save_icb_industries(self, df_icb: pl.DataFrame) -> None:
-        """Lưu danh mục ngành ICB vào PostgreSQL.
-
-        Args:
-            df_icb (pl.DataFrame): DataFrame chứa thông tin danh mục phân loại ngành ICB.
-
-        Raises:
-            Exception: Lỗi phát sinh khi thực hiện chèn/cập nhật thông tin vào cơ sở dữ liệu.
-        """
-        if df_icb is None or df_icb.is_empty():
-            return
-        self.logger.info(f"💾 [Postgres] Đang lưu {len(df_icb)} ngành ICB...")
-        try:
-            self._upsert_polars_to_pg(
-                df=df_icb,
-                table_name="icb_industries",
-                index_elements=["icb_code"],
-            )
-            self.logger.info("🎉 [Postgres] Lưu danh mục ngành ICB thành công.")
-        except Exception as e:
-            self.logger.error(f"❌ [Postgres] Gặp lỗi khi lưu danh mục ngành ICB: {e}")
-            raise e
-
-    def save_companies(self, df_companies: pl.DataFrame) -> None:
-        """Lưu danh sách công ty vào PostgreSQL.
-
-        Args:
-            df_companies (pl.DataFrame): DataFrame chứa thông tin danh sách các công ty.
-
-        Raises:
-            Exception: Lỗi phát sinh khi thực hiện chèn/cập nhật thông tin vào cơ sở dữ liệu.
-        """
-        if df_companies is None or df_companies.is_empty():
-            return
-        self.logger.info(
-            f"💾 [Postgres] Đang lưu {len(df_companies)} thông tin công ty..."
-        )
-        try:
-            self._upsert_polars_to_pg(
-                df=df_companies,
-                table_name="companies",
-                index_elements=["symbol"],
-            )
-            self.logger.info("🎉 [Postgres] Lưu thông tin công ty thành công.")
-        except Exception as e:
-            self.logger.error(f"❌ [Postgres] Gặp lỗi khi lưu thông tin công ty: {e}")
-            raise e
 
     def load_parquet_to_bigquery(
         self,
