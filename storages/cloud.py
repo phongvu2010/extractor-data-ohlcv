@@ -7,13 +7,16 @@ import gc
 import io
 import json
 import logging
+import math
 import re
+import time
 from typing import Any
 import uuid
 
+import google.api_core.exceptions
 from google.cloud import bigquery, storage
 import numpy as np
-import pandas as pd
+import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -22,7 +25,7 @@ from .base import BaseStorage
 
 
 class CustomJSONEncoder(json.JSONEncoder):
-    """Bộ mã hóa JSON tùy chỉnh để xử lý an toàn các kiểu dữ liệu NumPy và Pandas."""
+    """Bộ mã hóa JSON tùy chỉnh để xử lý an toàn các kiểu dữ liệu NumPy và Python native."""
 
     def default(self, obj: Any) -> Any:
         """Kiểm tra và ánh xạ kiểu dữ liệu tùy chỉnh về chuẩn JSON.
@@ -39,7 +42,8 @@ class CustomJSONEncoder(json.JSONEncoder):
             return float(obj)
         if isinstance(obj, np.ndarray):
             return obj.tolist()
-        if pd.isna(obj):
+
+        if obj is None or (isinstance(obj, float) and math.isnan(obj)):
             return None
         return super().default(obj)
 
@@ -72,14 +76,12 @@ class CloudStorage(BaseStorage):
             self.bq_client = bigquery.Client()
             self.bucket = self.client.bucket(Config.GCS_BUCKET_NAME)
             self.logger.info(
-                "☁️ [GCS] Kết nối thành công bằng Application Default Credentials (ADC)."
+                "✅ [GCS] Kết nối thành công qua Application Default Credentials (ADC)."
             )
-            self.logger.info(f"☁️ [GCS] Bucket: {Config.GCS_BUCKET_NAME}")
-            self.logger.info(f"📊 [BigQuery] Dự án: {self.bq_client.project}")
+            self.logger.info(f"ℹ️ [GCS] Bucket: {Config.GCS_BUCKET_NAME}")
+            self.logger.info(f"ℹ️ [BigQuery] Dự án: {self.bq_client.project}")
         except Exception as e:
-            self.logger.error(
-                f"🛑 [Storage] Lỗi khởi tạo kết nối Cloud Services qua ADC: {e}"
-            )
+            self.logger.error(f"❌ [Storage] Lỗi khởi tạo kết nối Cloud Services: {e}")
             raise e
 
         # Tự động quét và dọn dẹp các bảng staging rác của phiên trước
@@ -109,8 +111,12 @@ class CloudStorage(BaseStorage):
             """
             query_config: bigquery.QueryJobConfig = bigquery.QueryJobConfig(
                 query_parameters=[
-                    bigquery.ScalarQueryParameter("prefix_raw", "STRING", f"{prefix_raw}%"),
-                    bigquery.ScalarQueryParameter("prefix_adj", "STRING", f"{prefix_adj}%"),
+                    bigquery.ScalarQueryParameter(
+                        "prefix_raw", "STRING", f"{prefix_raw}%"
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "prefix_adj", "STRING", f"{prefix_adj}%"
+                    ),
                 ]
             )
             query_job: bigquery.QueryJob = self.bq_client.query(
@@ -122,12 +128,12 @@ class CloudStorage(BaseStorage):
 
             if not stale_tables:
                 self.logger.info(
-                    "✨ [BigQuery] Không phát hiện bảng staging nào còn sót lại."
+                    "✅ [BigQuery] Không phát hiện bảng staging nào còn sót lại."
                 )
                 return
 
             self.logger.warning(
-                f"🧹 [BigQuery] Phát hiện {len(stale_tables)} bảng staging còn sót lại: {stale_tables}"
+                f"⚠️ [BigQuery] Phát hiện {len(stale_tables)} bảng staging còn sót lại: {stale_tables}"
             )
             for table_id in stale_tables:
                 table_ref: str = (
@@ -135,7 +141,7 @@ class CloudStorage(BaseStorage):
                 )
                 try:
                     self.bq_client.delete_table(table_ref, not_found_ok=True)
-                    self.logger.info(f"🗑️ [BigQuery] Đã xóa bảng staging: {table_id}")
+                    self.logger.info(f"✅ [BigQuery] Đã xóa bảng staging: {table_id}")
                 except Exception as del_err:
                     self.logger.warning(
                         f"⚠️ [BigQuery] Không thể xóa bảng staging {table_id}: {del_err}"
@@ -145,41 +151,45 @@ class CloudStorage(BaseStorage):
                 f"❌ [BigQuery] Lỗi trong quá trình quét dọn bảng staging: {e}"
             )
 
-    def _df_to_parquet_bytes(self, df: pd.DataFrame, suffix: str) -> io.BytesIO:
+    def _df_to_parquet_bytes(self, df: pl.DataFrame, suffix: str) -> io.BytesIO:
         """Chuyển đổi DataFrame sang dữ liệu nén Parquet dạng BytesIO một cách tối ưu hiệu năng.
 
         Đối với dữ liệu 'adj', chuyển đổi cột giá sang kiểu decimal128 ở tầng PyArrow
-        thay vì dùng apply(Decimal) ở tầng Pandas nhằm tối đa hóa hiệu năng.
+        nhằm tối đa hóa hiệu năng.
 
         Args:
-            df (pd.DataFrame): DataFrame dữ liệu chứng khoán cần chuyển đổi.
+            df (pl.DataFrame): DataFrame dữ liệu chứng khoán cần chuyển đổi.
             suffix (str): Hậu tố để phân loại định dạng ('raw' hoặc 'adj').
 
         Returns:
             io.BytesIO: Đối tượng BytesIO chứa luồng dữ liệu Parquet đã được nén Snappy.
         """
-        df_write: pd.DataFrame = df.copy()
+        df_write: pl.DataFrame = df.clone()
 
         # Ép kiểu trading_date về Date thuần túy để khớp hoàn hảo với kiểu DATE của BigQuery
         if "trading_date" in df_write.columns:
-            df_write["trading_date"] = pd.to_datetime(df_write["trading_date"]).dt.date
+            df_write = df_write.with_columns(pl.col("trading_date").cast(pl.Date))
 
         price_cols: list[str] = ["open_price", "high_price", "low_price", "close_price"]
         if suffix == "raw":
-            df_write[price_cols] = df_write[price_cols].round(0).astype("Int64")
+            df_write = df_write.with_columns(
+                [pl.col(col).round(0).cast(pl.Int64) for col in price_cols]
+            )
         else:
-            # Giữ kiểu float64 và làm tròn 2 chữ số thập phân ở Pandas trước khi cast trong Arrow
-            df_write[price_cols] = df_write[price_cols].round(2).astype("float64")
+            # Giữ kiểu float64 và làm tròn 2 chữ số thập phân ở Polars trước khi cast trong Arrow
+            df_write = df_write.with_columns(
+                [pl.col(col).round(2).cast(pl.Float64) for col in price_cols]
+            )
 
         if "total_volume" in df_write.columns:
-            df_write["total_volume"] = df_write["total_volume"].astype("Int64")
+            df_write = df_write.with_columns(pl.col("total_volume").cast(pl.Int64))
 
         for col in ["symbol", "exchange", "source"]:
             if col in df_write.columns:
-                df_write[col] = df_write[col].astype(str)
+                df_write = df_write.with_columns(pl.col(col).cast(pl.String))
 
         # Chuyển đổi sang PyArrow Table
-        table: pa.Table = pa.Table.from_pandas(df_write, preserve_index=False)
+        table: pa.Table = df_write.to_arrow()
 
         # Cast các cột giá sang decimal128(18, 2) ở tầng Arrow (C++ layer) cực nhanh
         if suffix != "raw":
@@ -204,7 +214,7 @@ class CloudStorage(BaseStorage):
 
     def save_parquet(
         self,
-        df: pd.DataFrame,
+        df: pl.DataFrame,
         date_ref: datetime,
         suffix: str = "raw",
         partition: bool = False,
@@ -212,7 +222,7 @@ class CloudStorage(BaseStorage):
         """Ghi dữ liệu nén Parquet trực tiếp lên Google Cloud Storage (GCS).
 
         Args:
-            df (pd.DataFrame): DataFrame dữ liệu chứng khoán cần lưu.
+            df (pl.DataFrame): DataFrame dữ liệu chứng khoán cần lưu.
             date_ref (datetime): Mốc thời gian mặc định của tệp dữ liệu.
             suffix (str): Hậu tố định danh loại dữ liệu ('raw' hoặc 'adj').
             partition (bool): True để lưu phân mảnh theo năm/tháng, False để lưu file gộp tĩnh.
@@ -223,14 +233,17 @@ class CloudStorage(BaseStorage):
         Raises:
             Exception: Phát sinh khi ghi dữ liệu lên GCS thất bại.
         """
-        if df is None or df.empty:
+        if df is None or df.is_empty():
             return None
 
         # Tối ưu: Lấy ngày thực tế lớn nhất từ cột trading_date để đặt tên thư mục/file nếu có
         if "trading_date" in df.columns:
-            max_date: Any = pd.to_datetime(df["trading_date"]).max()
-            if not pd.isna(max_date):
-                date_ref = max_date
+            max_date: Any = df["trading_date"].max()
+            if max_date is not None:
+                if isinstance(max_date, date):
+                    date_ref = datetime.combine(max_date, datetime.min.time())
+                else:
+                    date_ref = max_date
 
         gcs_path: str
         if partition:
@@ -245,7 +258,7 @@ class CloudStorage(BaseStorage):
 
         try:
             self.logger.info(
-                f"💾 ☁️ [GCS] Đang ghi dữ liệu nén Parquet: gs://{Config.GCS_BUCKET_NAME}/{gcs_path}"
+                f"💾 [GCS] Đang ghi dữ liệu nén Parquet: gs://{Config.GCS_BUCKET_NAME}/{gcs_path}"
             )
 
             bio: io.BytesIO = self._df_to_parquet_bytes(df, suffix)
@@ -254,29 +267,27 @@ class CloudStorage(BaseStorage):
             blob.upload_from_file(bio, content_type="application/octet-stream")
 
             self.logger.info(
-                f"🎉 ☁️ [GCS] File lưu trữ thành công tại GCS: gs://{Config.GCS_BUCKET_NAME}/{gcs_path}"
+                f"✅ [GCS] File lưu trữ thành công tại GCS: gs://{Config.GCS_BUCKET_NAME}/{gcs_path}"
             )
             return gcs_path
         except Exception as e:
-            self.logger.error(
-                f"❌ ☁️ [GCS] Lỗi trong quá trình ghi file Parquet lên GCS: {e}"
-            )
+            self.logger.error(f"❌ [GCS] Lỗi ghi file Parquet lên GCS: {e}")
             raise e
 
     def save_symbol_history(
-        self, df: pd.DataFrame, symbol: str, suffix: str = "adj"
+        self, df: pl.DataFrame, symbol: str, suffix: str = "adj"
     ) -> None:
         """Ghi toàn bộ lịch sử giá của một mã cổ phiếu cụ thể ra file Parquet riêng biệt trên GCS.
 
         Args:
-            df (pd.DataFrame): DataFrame dữ liệu lịch sử đầy đủ của mã cổ phiếu.
+            df (pl.DataFrame): DataFrame dữ liệu lịch sử đầy đủ của mã cổ phiếu.
             symbol (str): Mã cổ phiếu cần lưu (ví dụ: FPT).
             suffix (str): Tiền tố thư mục lưu trữ ('raw' hoặc 'adj').
 
         Raises:
             Exception: Phát sinh khi ghi dữ liệu lên GCS thất bại.
         """
-        if df is None or df.empty:
+        if df is None or df.is_empty():
             return
 
         gcs_path: str = (
@@ -285,7 +296,7 @@ class CloudStorage(BaseStorage):
 
         try:
             self.logger.info(
-                f"💾 ☁️ [GCS] Đang ghi dữ liệu lịch sử cho mã {symbol.upper()} "
+                f"💾 [GCS] Đang ghi dữ liệu lịch sử cho mã {symbol.upper()} "
                 f"tại: gs://{Config.GCS_BUCKET_NAME}/{gcs_path}"
             )
 
@@ -316,9 +327,7 @@ class CloudStorage(BaseStorage):
         try:
             self.bq_client.get_dataset(dataset_ref)
         except Exception:
-            self.logger.info(
-                f"✨ [BigQuery] Đang khởi tạo dataset mới: {Config.BQ_DATASET}"
-            )
+            self.logger.info(f"✅ [BigQuery] Đang tạo dataset mới: {Config.BQ_DATASET}")
             self.bq_client.create_dataset(bigquery.Dataset(dataset_ref))
 
         table_ref: str = f"{self.bq_client.project}.{Config.BQ_DATASET}.{table_name}"
@@ -326,7 +335,7 @@ class CloudStorage(BaseStorage):
             self.bq_client.get_table(table_ref)
         except Exception:
             self.logger.info(
-                f"✨ [BigQuery] Đang tạo bảng mới {table_name} với Monthly Partitioning & Clustering..."
+                f"✅ [BigQuery] Đang tạo bảng mới {table_name} với Monthly Partitioning & Clustering..."
             )
             # Xác định kiểu dữ liệu giá là INTEGER cho bảng raw và NUMERIC cho các bảng khác (tránh lỗi lệch kiểu khi tạo mới)
             price_type: str = (
@@ -372,7 +381,7 @@ class CloudStorage(BaseStorage):
             f"{Config.GCS_PARQUET_PREFIX}/adj/reloaded/{symbol_upper}.parquet"
         )
         self.logger.info(
-            f"⚡ [BigQuery] Bắt đầu đồng bộ lịch sử điều chỉnh (Staging Mode) cho mã {symbol_upper}..."
+            f"⚡ [BigQuery] Bắt đầu đồng bộ lịch sử điều chỉnh cho mã {symbol_upper}..."
         )
 
         target_table_ref: str = (
@@ -399,21 +408,21 @@ class CloudStorage(BaseStorage):
 
         try:
             self.logger.info(
-                f"⚡ [BigQuery] Bước 1: Nạp file Parquet từ GCS vào bảng Staging: {staging_table_name}..."
+                f"⚡ [BigQuery] [Step 1] Nạp file Parquet từ GCS vào bảng Staging: {staging_table_name}..."
             )
             load_job: bigquery.LoadJob = self.bq_client.load_table_from_uri(
                 gcs_uri, staging_table_ref, job_config=job_config
             )
             load_job.result()
             self.logger.info(
-                f"🎉 [BigQuery] Nạp thành công vào bảng tạm {staging_table_name}. "
-                f"Đã nạp {load_job.output_rows} dòng."
+                f"✅ [BigQuery] Nạp thành công vào bảng tạm {staging_table_name} "
+                f"({load_job.output_rows} dòng)."
             )
 
             # 1.5. Xác định ngày giao dịch nhỏ nhất để làm mốc cắt tỉa phân vùng tĩnh
             if min_date is None:
                 self.logger.info(
-                    f"⚡ [BigQuery] Đang lấy ngày giao dịch nhỏ nhất từ bảng tạm {staging_table_name}..."
+                    f"⚡ [BigQuery] Đang xác định ngày giao dịch nhỏ nhất từ bảng tạm {staging_table_name}..."
                 )
                 min_date_query: str = (
                     f"SELECT MIN(trading_date) as min_date FROM `{staging_table_ref}`"
@@ -427,16 +436,16 @@ class CloudStorage(BaseStorage):
                     else datetime.now(Config.VN_TZ).date()
                 )
                 self.logger.info(
-                    f"📅 [BigQuery] Ngày giao dịch nhỏ nhất phát hiện từ staging: {min_date}"
+                    f"ℹ️ [BigQuery] Ngày giao dịch nhỏ nhất từ staging: {min_date}"
                 )
             else:
                 self.logger.info(
-                    f"📅 [BigQuery] Sử dụng ngày giao dịch nhỏ nhất truyền từ RAM: {min_date}"
+                    f"ℹ️ [BigQuery] Sử dụng ngày giao dịch nhỏ nhất truyền từ RAM: {min_date}"
                 )
 
             # 2. Chạy giao dịch SQL để xóa dữ liệu cũ (có phân vùng tĩnh) và chèn dữ liệu mới từ bảng tạm
             self.logger.info(
-                f"⚡ [BigQuery] Bước 2: Thực thi giao dịch SQL đồng bộ sang bảng chính {Config.BQ_ADJ_TABLE}..."
+                f"⚡ [BigQuery] [Step 2] Thực thi giao dịch SQL đồng bộ sang bảng chính {Config.BQ_ADJ_TABLE}..."
             )
             sync_query: str = f"""
             BEGIN TRANSACTION;
@@ -466,7 +475,7 @@ class CloudStorage(BaseStorage):
             )
             query_job.result()
             self.logger.info(
-                f"🎉 [BigQuery] Đồng bộ hoàn tất giao dịch SQL cho mã {symbol_upper}."
+                f"✅ [BigQuery] Đồng bộ hoàn tất giao dịch SQL cho mã {symbol_upper}."
             )
 
         except Exception as e:
@@ -478,7 +487,7 @@ class CloudStorage(BaseStorage):
             # 3. Dọn dẹp bảng Staging kể cả khi chạy thành công hay thất bại
             try:
                 self.logger.info(
-                    f"🧹 [BigQuery] Bước 3: Dọn dẹp dứt điểm bảng tạm {staging_table_name}..."
+                    f"🧹 [BigQuery] [Step 3] Dọn dẹp bảng tạm {staging_table_name}..."
                 )
                 self.bq_client.delete_table(staging_table_ref, not_found_ok=True)
             except Exception as clean_err:
@@ -506,14 +515,10 @@ class CloudStorage(BaseStorage):
         valid_symbols: list[str] = []
         valid_gcs_uris: list[str] = []
         for sym in symbols_upper:
-            blob_key: str = (
-                f"{Config.GCS_PARQUET_PREFIX}/adj/reloaded/{sym}.parquet"
-            )
+            blob_key: str = f"{Config.GCS_PARQUET_PREFIX}/adj/reloaded/{sym}.parquet"
             if self.bucket.blob(blob_key).exists():
                 valid_symbols.append(sym)
-                valid_gcs_uris.append(
-                    f"gs://{Config.GCS_BUCKET_NAME}/{blob_key}"
-                )
+                valid_gcs_uris.append(f"gs://{Config.GCS_BUCKET_NAME}/{blob_key}")
             else:
                 self.logger.warning(
                     f"⚠️ [BigQuery] Bỏ qua mã {sym} do không tìm thấy file Parquet trên GCS: "
@@ -522,7 +527,7 @@ class CloudStorage(BaseStorage):
 
         if not valid_gcs_uris:
             self.logger.warning(
-                "⚠️ [BigQuery] Không có mã nào có file Parquet hợp lệ trên GCS. Hủy đồng bộ gộp."
+                "⚠️ [BigQuery] Không có mã nào có file Parquet hợp lệ trên GCS. Hủy đồng bộ."
             )
             return
 
@@ -550,20 +555,20 @@ class CloudStorage(BaseStorage):
 
         try:
             self.logger.info(
-                f"⚡ [BigQuery] Bước 1: Nạp các file Parquet từ GCS vào bảng Staging chung: {staging_table_name}..."
+                f"⚡ [BigQuery] [Step 1] Nạp các file Parquet từ GCS vào bảng Staging: {staging_table_name}..."
             )
             load_job: bigquery.LoadJob = self.bq_client.load_table_from_uri(
                 valid_gcs_uris, staging_table_ref, job_config=job_config
             )
             load_job.result()
             self.logger.info(
-                f"🎉 [BigQuery] Nạp thành công vào bảng tạm {staging_table_name}. "
-                f"Đã nạp {load_job.output_rows} dòng."
+                f"✅ [BigQuery] Nạp thành công vào bảng tạm {staging_table_name} "
+                f"({load_job.output_rows} dòng)."
             )
 
             # 1.5. Xác định ngày giao dịch nhỏ nhất để làm mốc cắt tỉa phân vùng tĩnh
             self.logger.info(
-                "⚡ [BigQuery] Đang lấy ngày giao dịch nhỏ nhất từ bảng tạm..."
+                "⚡ [BigQuery] Đang xác định ngày giao dịch nhỏ nhất từ bảng tạm..."
             )
             min_date_query: str = (
                 f"SELECT MIN(trading_date) as min_date FROM `{staging_table_ref}`"
@@ -577,12 +582,12 @@ class CloudStorage(BaseStorage):
                 else datetime.now(Config.VN_TZ).date()
             )
             self.logger.info(
-                f"📅 [BigQuery] Ngày giao dịch nhỏ nhất phát hiện từ staging: {min_date}"
+                f"ℹ️ [BigQuery] Ngày giao dịch nhỏ nhất từ staging: {min_date}"
             )
 
             # 2. Chạy giao dịch SQL để xóa dữ liệu cũ (có phân vùng tĩnh) và chèn dữ liệu mới từ bảng tạm
             self.logger.info(
-                f"⚡ [BigQuery] Bước 2: Thực thi giao dịch SQL đồng bộ sang bảng chính {Config.BQ_ADJ_TABLE}..."
+                f"⚡ [BigQuery] [Step 2] Thực thi giao dịch SQL đồng bộ sang bảng chính {Config.BQ_ADJ_TABLE}..."
             )
             sync_query: str = f"""
             BEGIN TRANSACTION;
@@ -612,7 +617,7 @@ class CloudStorage(BaseStorage):
             )
             query_job.result()
             self.logger.info(
-                f"🎉 [BigQuery] Đồng bộ hoàn tất giao dịch SQL gộp cho {len(valid_symbols)} mã."
+                f"✅ [BigQuery] Đồng bộ hoàn tất giao dịch SQL gộp cho {len(valid_symbols)} mã."
             )
 
         except Exception as e:
@@ -622,7 +627,7 @@ class CloudStorage(BaseStorage):
             # 3. Dọn dẹp bảng Staging kể cả khi chạy thành công hay thất bại
             try:
                 self.logger.info(
-                    f"🧹 [BigQuery] Bước 3: Dọn dẹp dứt điểm bảng tạm {staging_table_name}..."
+                    f"🧹 [BigQuery] [Step 3] Dọn dẹp bảng tạm {staging_table_name}..."
                 )
                 self.bq_client.delete_table(staging_table_ref, not_found_ok=True)
             except Exception as clean_err:
@@ -862,47 +867,6 @@ class CloudStorage(BaseStorage):
             )
             raise e
 
-    def delete_by_date(self, table_name: str, date_ref: datetime | date | str) -> None:
-        """Xóa toàn bộ bản ghi của một ngày cụ thể trong bảng BigQuery.
-
-        Giúp đảm bảo tính idempotent của pipeline (chạy lại nhiều lần không sinh bản ghi thừa).
-
-        Args:
-            table_name (str): Tên bảng đích BigQuery.
-            date_ref (Union[datetime, date, str]): Ngày giao dịch cần xóa.
-
-        Raises:
-            Exception: Phát sinh khi câu lệnh DELETE bị lỗi.
-        """
-        date_str: str = (
-            date_ref.strftime("%Y-%m-%d")
-            if hasattr(date_ref, "strftime")
-            else str(date_ref)
-        )
-        table_ref: str = f"`{self.bq_client.project}.{Config.BQ_DATASET}.{table_name}`"
-
-        self._ensure_table_exists(table_name)
-        self.logger.info(
-            f"🗑️ [BigQuery] Đang xóa dữ liệu cũ ngày {date_str} từ bảng {table_ref}..."
-        )
-
-        query: str = f"DELETE FROM {table_ref} WHERE trading_date = @target_date"
-        query_config: bigquery.QueryJobConfig = bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter("target_date", "DATE", date_str),
-            ]
-        )
-        try:
-            query_job: bigquery.QueryJob = self.bq_client.query(
-                query, job_config=query_config
-            )
-            query_job.result()
-            self.logger.info(f"🎉 [BigQuery] Đã dọn dẹp xong dữ liệu ngày {date_str}.")
-        except Exception as e:
-            self.logger.error(
-                f"❌ [BigQuery] Lỗi khi dọn dẹp dữ liệu ngày {date_str}: {e}"
-            )
-            raise e
 
     def read_checkpoint(self) -> dict[str, Any]:
         """Đọc tệp snapshot thị trường EOD được lưu trữ trước đó trên GCS.
@@ -926,129 +890,33 @@ class CloudStorage(BaseStorage):
 
     def save_checkpoint(
         self,
-        df: pd.DataFrame,
+        df: pl.DataFrame,
         active_symbols: set[str] | None = None,
         pending_adjusted_reloads: list[str] | None = None,
     ) -> None:
         """Trích xuất và cập nhật trạng thái thị trường EOD (Snapshot) trực tiếp lên GCS.
 
         Args:
-            df (pd.DataFrame): DataFrame dữ liệu tổng hợp của ngày chạy hiện tại.
+            df (pl.DataFrame): DataFrame dữ liệu tổng hợp của ngày chạy hiện tại.
             active_symbols (Optional[set[str]]): Danh sách các mã cổ phiếu đang niêm yết thực tế trên thị trường.
             pending_adjusted_reloads (Optional[list[str]]): Danh sách các mã lỗi cần chạy lại lịch sử điều chỉnh lần sau.
         """
-        if df is None or df.empty:
+        if df is None or df.is_empty():
             return
 
         self.logger.info("⚡ [Snapshot] Đang trích xuất trạng thái thị trường EOD...")
 
-        # 1. Lọc lấy bản ghi mới nhất của ngày hôm nay cho từng mã
-        df_latest: pd.DataFrame = df.drop_duplicates(
-            subset=["symbol"], keep="last"
-        ).copy()
-
-        # Tính toán giá trung bình nhanh chóng bằng toán tử cột
-        price_cols: list[str] = ["open_price", "high_price", "low_price", "close_price"]
-        if "average_price" not in df_latest.columns:
-            df_latest["average_price"] = df_latest[price_cols].mean(axis=1)
-
-        # Chuẩn hóa kiểu dữ liệu số thực về int (Raw prices) và float64 (average_price) để lưu sạch trên JSON
-        for col in price_cols:
-            df_latest[col] = df_latest[col].astype(float).round(0).astype(int)
-        df_latest["average_price"] = df_latest["average_price"].astype(float).round(1)
-
-        # Chuẩn hóa cột ngày sang chuỗi YYYY-MM-DD
-        df_latest["trading_date"] = df_latest["trading_date"].dt.strftime("%Y-%m-%d")
-
-        # Lấy ngày chạy lớn nhất để lưu metadata
-        max_date_str: str = str(df_latest["trading_date"].max())
-
-        # Tự động tính toán xem dữ liệu này đã được chốt phiên cuối ngày (EOD) chưa
-        vn_now: datetime = datetime.now(Config.VN_TZ)
-        today_str: str = vn_now.strftime("%Y-%m-%d")
-        is_eod: bool
-        if max_date_str < today_str:
-            is_eod = True
-        else:
-            # Thị trường chứng khoán Việt Nam chốt phiên lúc 15:00 và dữ liệu hoàn tất sau 15:15
-            is_eod = vn_now.hour > 15 or (vn_now.hour == 15 and vn_now.minute >= 15)
-
-        # Đảm bảo index symbol là chuỗi thông thường (không phải categorical) để xuất dict sạch sẽ
-        if isinstance(df_latest["symbol"].dtype, pd.CategoricalDtype):
-            df_latest["symbol"] = df_latest["symbol"].astype(str)
-        df_latest.set_index("symbol", inplace=True)
-
-        # Chỉ lấy các cột cần thiết, ép kiểu chuẩn về dict nguyên bản của Python để gom JSON
-        cols_to_extract: list[str] = [
-            "exchange",
-            "trading_date",
-            "open_price",
-            "high_price",
-            "low_price",
-            "close_price",
-            "average_price",
-            "total_volume",
-        ]
-        current_data_dict: dict[str, dict[str, Any]] = df_latest[
-            cols_to_extract
-        ].to_dict(orient="index")
-
-        # 2. Đọc dữ liệu lịch sử cũ từ file checkpoint trên GCS
+        # Xây dựng cấu trúc JSON snapshot qua phương thức dùng chung trên BaseStorage
         old_checkpoint: dict[str, Any] = self.read_checkpoint()
-        merged_snapshots: dict[str, dict[str, Any]] = old_checkpoint.get(
-            "snapshots", {}
+        final_json_structure: dict[str, Any] = self._build_eod_snapshot(
+            df=df,
+            active_symbols=active_symbols,
+            pending_adjusted_reloads=pending_adjusted_reloads,
+            old_checkpoint=old_checkpoint,
         )
-        old_metadata: dict[str, Any] = old_checkpoint.get("metadata") or {}
-        old_pending: list[str] = old_metadata.get("pending_adjusted_reloads") or []
+        final_snapshots: dict[str, Any] = final_json_structure["snapshots"]
 
-        # Hợp nhất pending_adjusted_reloads cũ nếu không được truyền vào mới
-        if pending_adjusted_reloads is None:
-            pending_adjusted_reloads = old_pending
-
-        # 3. Tiến hành Hợp nhất (Upsert) - Chỉ cập nhật snapshots khi đã chốt phiên EOD thực tế
-        if is_eod:
-            for sym, new_row in current_data_dict.items():
-                if not sym:
-                    continue
-                old_row: dict[str, Any] | None = merged_snapshots.get(sym)
-                # Nếu mã chưa có hoặc có ngày mới hơn/bằng ngày cũ -> Cập nhật thông tin mới nhất
-                if not old_row or new_row["trading_date"] >= old_row["trading_date"]:
-                    merged_snapshots[sym] = new_row
-        else:
-            self.logger.info(
-                "ℹ️ [Snapshot] Đang chạy trong phiên (Chưa chốt EOD). "
-                "Giữ nguyên dữ liệu snapshots lịch sử từ phiên EOD trước."
-            )
-
-        # Chuẩn hóa toàn bộ dữ liệu trong merged_snapshots để dọn dẹp các tàn dư float32 cũ
-        for sym, row in merged_snapshots.items():
-            for col in price_cols:
-                if col in row and isinstance(row[col], (int, float)):
-                    row[col] = int(round(float(row[col])))
-            if "average_price" in row and isinstance(
-                row["average_price"], (int, float)
-            ):
-                row["average_price"] = round(float(row["average_price"]), 1)
-
-        # 4. Áp dụng bộ lọc active_symbols & Sắp xếp Alphabet gọn gàng
-        final_snapshots: dict[str, dict[str, Any]] = {}
-        for sym in sorted(merged_snapshots.keys()):
-            if active_symbols and sym not in active_symbols:
-                continue
-            final_snapshots[sym] = merged_snapshots[sym]
-
-        # 5. Cấu trúc JSON cuối cùng
-        final_json_structure: dict[str, Any] = {
-            "metadata": {
-                "last_successful_run": max_date_str,
-                "is_eod": is_eod,
-                "total_tickers": len(final_snapshots),
-                "pending_adjusted_reloads": pending_adjusted_reloads,
-            },
-            "snapshots": final_snapshots,
-        }
-
-        # 6. Upload JSON trực tiếp lên GCS
+        # Upload JSON trực tiếp lên GCS
         try:
             json_str: str = json.dumps(
                 final_json_structure,
@@ -1059,7 +927,7 @@ class CloudStorage(BaseStorage):
             blob: storage.Blob = self.bucket.blob(Config.GCS_CHECKPOINT_KEY)
             blob.upload_from_string(json_str, content_type="application/json")
             self.logger.info(
-                f"💾 ☁️ [Snapshot Thành Công] Đã cập nhật tổng cộng {len(final_snapshots)} mã "
+                f"☁️ [Snapshot Thành Công] 💾 Đã cập nhật tổng cộng {len(final_snapshots)} mã "
                 f"tại GCS: gs://{Config.GCS_BUCKET_NAME}/{Config.GCS_CHECKPOINT_KEY}"
             )
         except Exception as e:
@@ -1067,8 +935,6 @@ class CloudStorage(BaseStorage):
                 f"🛑 [GCS] Ghi tệp snapshot trạng thái lên GCS thất bại: {e}"
             )
         finally:
-            # Giải phóng các cấu trúc dữ liệu lớn thủ công để tối ưu RAM
-            del current_data_dict, merged_snapshots, final_snapshots
             gc.collect()
 
     def read_blacklist(self) -> set[str]:
@@ -1128,8 +994,17 @@ class CloudStorage(BaseStorage):
         """
         # 1. Đọc tệp cấu hình danh sách mã quan tâm từ GCS
         tickers_key: str = Config.GCS_EXPORT_TICKERS_KEY
-        blob: storage.Blob = self.bucket.blob(tickers_key)
+        export_years: int = Config.GCS_EXPORT_YEARS
 
+        # Bỏ qua export nếu không được cấu hình trong Environment Variables
+        if not tickers_key or export_years <= 0:
+            self.logger.info(
+                "Không cấu hình GCS_EXPORT_TICKERS_KEY hoặc GCS_EXPORT_YEARS. Bỏ qua trích xuất dữ liệu."
+            )
+            return None
+
+        # 1. Định danh sách mã quan tâm từ GCS
+        blob: storage.Blob = self.bucket.blob(tickers_key)
         if not blob.exists():
             self.logger.info(
                 f"ℹ️ Không tìm thấy file danh sách mã cổ phiếu quan tâm tại "
@@ -1210,13 +1085,14 @@ class CloudStorage(BaseStorage):
                         bigquery.ScalarQueryParameter("start_date", "DATE", start_date),
                     ]
                 )
-                df_raw_batch: pd.DataFrame = self.bq_client.query(
+                df_raw_batch_arrow = self.bq_client.query(
                     raw_query, job_config=raw_job_config
-                ).to_dataframe()
+                ).to_arrow()
+                df_raw_batch: pl.DataFrame = pl.from_arrow(df_raw_batch_arrow)
 
-                if not df_raw_batch.empty:
-                    for ticker, group in df_raw_batch.groupby("symbol"):
-                        ticker_str: str = str(ticker).strip().upper()
+                if not df_raw_batch.is_empty():
+                    for group in df_raw_batch.partition_by("symbol"):
+                        ticker_str: str = str(group[0, "symbol"]).strip().upper()
                         gcs_path: str = f"{export_prefix}/raw/{ticker_str}.parquet"
 
                         bio: io.BytesIO = self._df_to_parquet_bytes(group, suffix="raw")
@@ -1256,27 +1132,33 @@ class CloudStorage(BaseStorage):
                         bigquery.ScalarQueryParameter("start_date", "DATE", start_date),
                     ]
                 )
-                df_adj_batch: pd.DataFrame = self.bq_client.query(
+                df_adj_batch_arrow = self.bq_client.query(
                     adj_query, job_config=adj_job_config
-                ).to_dataframe()
+                ).to_arrow()
+                df_adj_batch: pl.DataFrame = pl.from_arrow(df_adj_batch_arrow)
 
-                if not df_adj_batch.empty:
-                    for ticker, group in df_adj_batch.groupby("symbol"):
-                        ticker_str = str(ticker).strip().upper()
-                        gcs_path = f"{export_prefix}/adj/{ticker_str}.parquet"
+                # Sử dụng LazyFrame để phân hoạch và lưu Parquet
+                df_adj_lazy = df_adj_batch.lazy()
 
-                        bio = self._df_to_parquet_bytes(group, suffix="adj")
+                # Thay đổi logic partition_by bằng map qua unique symbols
+                # Việc collect() từng mã nhỏ giúp tiết kiệm RAM tự nhiên
+                unique_symbols = df_adj_batch["symbol"].unique().to_list()
+                for ticker_str in unique_symbols:
+                    ticker_str = str(ticker_str).strip().upper()
+                    gcs_path = f"{export_prefix}/adj/{ticker_str}.parquet"
 
+                    # Thực thi lazy filter và collect ngay tại chỗ
+                    group_df = df_adj_lazy.filter(
+                        pl.col("symbol") == ticker_str
+                    ).collect()
+                    if not group_df.is_empty():
+                        bio = self._df_to_parquet_bytes(group_df, suffix="adj")
                         blob = self.bucket.blob(gcs_path)
                         blob.upload_from_file(
                             bio, content_type="application/octet-stream"
                         )
-                        adj_count += len(group)
+                        adj_count += len(group_df)
                         exported_adj_tickers.add(ticker_str)
-
-                # Giải phóng bộ nhớ của lô hiện tại trước khi chuyển sang lô tiếp theo
-                del df_adj_batch
-                gc.collect()
 
             exported_tickers_count: int = len(
                 exported_raw_tickers.union(exported_adj_tickers)
@@ -1302,33 +1184,295 @@ class CloudStorage(BaseStorage):
             raise e
 
     def save_corporate_events(self, events: list[dict[str, Any]]) -> None:
-        """Ghi nhận sự kiện doanh nghiệp (Không thực hiện ở phiên bản CloudStorage).
+        """Ghi nhận sự kiện doanh nghiệp (chia tách, cổ tức...) lên BigQuery.
 
         Args:
             events (list[dict[str, Any]]): Danh sách các sự kiện doanh nghiệp.
         """
-        pass
+        if not events:
+            return
+
+        self.logger.info(
+            f"📥 [BigQuery] Đang lưu {len(events)} sự kiện doanh nghiệp..."
+        )
+        target_table_name = "corporate_events"
+        target_table_ref = (
+            f"{self.bq_client.project}.{Config.BQ_DATASET}.{target_table_name}"
+        )
+
+        # 1. Đảm bảo bảng đích đã tồn tại (khởi tạo schema nếu chưa có)
+        try:
+            self.bq_client.get_table(target_table_ref)
+        except Exception:
+            self.logger.info(f"⚡ [BigQuery] Khởi tạo bảng mới: {target_table_name}")
+            schema = [
+                bigquery.SchemaField("symbol", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("event_type", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("ex_date", "DATE", mode="REQUIRED"),
+                bigquery.SchemaField("record_date", "DATE"),
+                bigquery.SchemaField("ratio", "STRING"),
+            ]
+            table = bigquery.Table(target_table_ref, schema=schema)
+            self.bq_client.create_table(table)
+
+        # 2. Đẩy dữ liệu vào bảng tạm (Staging)
+        run_id = uuid.uuid4().hex[:8]
+        staging_table_name = f"corporate_events_staging_{run_id}"
+        staging_table_ref = (
+            f"{self.bq_client.project}.{Config.BQ_DATASET}.{staging_table_name}"
+        )
+
+        try:
+            # Chuyển đổi events thành Polars DataFrame rồi sang Parquet bytes
+            df_events = pl.DataFrame(events)
+
+            # Ép kiểu Date chặt chẽ trước khi đẩy lên BigQuery
+            if "ex_date" in df_events.columns:
+                df_events = df_events.with_columns(pl.col("ex_date").cast(pl.Date))
+            if "record_date" in df_events.columns:
+                df_events = df_events.with_columns(pl.col("record_date").cast(pl.Date))
+
+            bio = io.BytesIO()
+            df_events.write_parquet(bio, compression="snappy")
+            bio.seek(0)
+
+            job_config = bigquery.LoadJobConfig(
+                write_disposition="WRITE_TRUNCATE",
+                source_format=bigquery.SourceFormat.PARQUET,
+            )
+            load_job = self.bq_client.load_table_from_file(
+                bio, staging_table_ref, job_config=job_config
+            )
+            load_job.result()
+
+            # 3. MERGE để chống trùng lặp dựa trên khóa phức hợp (symbol, event_type, ex_date)
+            merge_query = f"""
+            MERGE `{target_table_ref}` T
+            USING `{staging_table_ref}` S
+            ON T.symbol = S.symbol AND T.event_type = S.event_type AND T.ex_date = S.ex_date
+            WHEN MATCHED THEN
+              UPDATE SET
+                record_date = COALESCE(S.record_date, T.record_date),
+                ratio = COALESCE(S.ratio, T.ratio)
+            WHEN NOT MATCHED THEN
+              INSERT (symbol, event_type, ex_date, record_date, ratio)
+              VALUES (S.symbol, S.event_type, S.ex_date, S.record_date, S.ratio)
+            """
+            query_job = self.bq_client.query(merge_query)
+            query_job.result()
+
+            self.logger.info("💾 [BigQuery] Lưu sự kiện doanh nghiệp thành công.")
+        except Exception as e:
+            self.logger.error(
+                f"  [BigQuery] Lỗi khi lưu sự kiện doanh nghiệp: {e}", exc_info=True
+            )
+        finally:
+            # 4. Dọn dẹp bảng tạm
+            try:
+                self.bq_client.delete_table(staging_table_ref, not_found_ok=True)
+            except Exception as clean_err:
+                self.logger.warning(
+                    f"  [BigQuery] Không thể dọn bảng tạm {staging_table_name}: {clean_err}"
+                )
 
     def get_state(self, key: str) -> Any:
-        """Đọc trạng thái (Không thực hiện ở phiên bản CloudStorage)."""
+        """Đọc trạng thái tùy ý từ tệp JSON checkpoints/state.json trên GCS.
+
+        Args:
+            key (str): Khóa của trạng thái cần đọc.
+
+        Returns:
+            Any: Giá trị của trạng thái, hoặc None nếu không tồn tại hoặc lỗi.
+        """
+        try:
+            blob = self.bucket.blob("checkpoints/state.json")
+            if blob.exists():
+                json_str = blob.download_as_text(encoding="utf-8")
+                data = json.loads(json_str)
+                return data.get(key)
+        except Exception as e:
+            self.logger.warning(f"⚠️ [GCS] Lỗi khi đọc trạng thái '{key}' từ GCS: {e}")
         return None
 
     def save_state(self, key: str, value: Any) -> None:
-        """Lưu trạng thái (Không thực hiện ở phiên bản CloudStorage)."""
-        pass
+        """Lưu trạng thái tùy ý vào tệp JSON checkpoints/state.json trên GCS.
 
-    def save_icb_industries(self, df_icb: pd.DataFrame) -> None:
-        """Ghi nhận danh mục ngành ICB (Không thực hiện ở phiên bản CloudStorage).
-
-        Args:
-            df_icb (pd.DataFrame): DataFrame chứa thông tin danh mục phân loại ngành ICB.
-        """
-        pass
-
-    def save_companies(self, df_companies: pd.DataFrame) -> None:
-        """Ghi nhận danh sách công ty (Không thực hiện ở phiên bản CloudStorage).
+        Sử dụng cơ chế Optimistic Concurrency Control (Optimistic Locking) thông qua
+        generation của GCS và retry logic với exponential backoff để ngăn ngừa triệt để
+        rủi ro Race Condition khi có nhiều container chạy đồng thời.
 
         Args:
-            df_companies (pd.DataFrame): DataFrame chứa thông tin danh sách các công ty.
+            key (str): Khóa của trạng thái cần lưu.
+            value (Any): Giá trị của trạng thái cần lưu.
         """
-        pass
+        max_retries: int = 5
+        backoff_delay: float = 0.5
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                blob = self.bucket.blob("checkpoints/state.json")
+                data = {}
+                generation = 0
+
+                # Tải metadata mới nhất của blob bao gồm generation hiện tại
+                try:
+                    blob.reload()
+                    if blob.exists():
+                        generation = blob.generation
+                        json_str = blob.download_as_text(encoding="utf-8")
+                        data = json.loads(json_str)
+                except google.api_core.exceptions.NotFound:
+                    # Nếu file chưa tồn tại, generation match = 0 đảm bảo chỉ tạo file nếu không ai tạo trước đó
+                    generation = 0
+                except Exception:
+                    pass
+
+                data[key] = value
+
+                # Upload với điều kiện generation khớp
+                blob.upload_from_string(
+                    json.dumps(data, ensure_ascii=False, indent=2),
+                    content_type="application/json",
+                    if_generation_match=generation,
+                )
+                return
+            except google.api_core.exceptions.PreconditionFailed:
+                # Lỗi 412: Có tiến trình khác đã cập nhật file state.json trước đó
+                if attempt == max_retries:
+                    self.logger.error(
+                        f"🛑 [GCS] Gặp xung đột Race Condition liên tục khi lưu trạng thái '{key}'. "
+                        f"Đã thử lại {max_retries} lần nhưng vẫn thất bại."
+                    )
+                    raise
+                self.logger.warning(
+                    f"⚠️ [GCS] Phát hiện xung đột Race Condition khi lưu trạng thái '{key}' (lần {attempt}/{max_retries}). "
+                    f"Đang thử lại sau {backoff_delay * attempt}s..."
+                )
+                time.sleep(backoff_delay * attempt)
+            except Exception as e:
+                self.logger.error(
+                    f"❌ [GCS] Lỗi khi lưu trạng thái '{key}' lên GCS: {e}"
+                )
+                raise e
+
+    def save_icb_industries(self, df_icb: pl.DataFrame) -> None:
+        """Ghi nhận danh mục ngành ICB lên BigQuery (Ghi đè hoàn toàn).
+
+        Args:
+            df_icb (pl.DataFrame): DataFrame chứa thông tin danh mục phân loại ngành ICB.
+        """
+        if df_icb is None or df_icb.is_empty():
+            return
+        self.logger.info(f"💾 [BigQuery] Đang lưu {len(df_icb)} ngành ICB...")
+        table_ref = f"{self.bq_client.project}.{Config.BQ_DATASET}.icb_industries"
+        job_config = bigquery.LoadJobConfig(
+            write_disposition="WRITE_TRUNCATE",
+            source_format=bigquery.SourceFormat.PARQUET,
+        )
+        try:
+            # Ghi trực tiếp từ Polars sang Parquet trong RAM
+            bio = io.BytesIO()
+            df_icb.write_parquet(bio, compression="snappy")
+            bio.seek(0)
+
+            job = self.bq_client.load_table_from_file(
+                bio, table_ref, job_config=job_config
+            )
+            job.result()
+            self.logger.info("🎉 [BigQuery] Ghi danh mục ngành ICB thành công.")
+        except Exception as e:
+            self.logger.error(f"❌ [BigQuery] Gặp lỗi khi lưu danh mục ngành ICB: {e}")
+            raise e
+
+    def save_companies(self, df_companies: pl.DataFrame) -> None:
+        """Ghi nhận danh sách công ty lên BigQuery.
+
+        Args:
+            df_companies (pl.DataFrame): DataFrame chứa thông tin danh sách các công ty.
+        """
+        if df_companies is None or df_companies.is_empty():
+            return
+
+        self.logger.info(
+            f"📥 [BigQuery] Đang đồng bộ {len(df_companies)} thông tin công ty..."
+        )
+        target_table_name = "companies"
+        target_table_ref = (
+            f"{self.bq_client.project}.{Config.BQ_DATASET}.{target_table_name}"
+        )
+
+        run_id = uuid.uuid4().hex[:8]
+        staging_table_name = f"companies_staging_{run_id}"
+        staging_table_ref = (
+            f"{self.bq_client.project}.{Config.BQ_DATASET}.{staging_table_name}"
+        )
+
+        # 1. Đảm bảo bảng đích đã tồn tại (nếu chưa có thì tạo mới)
+        try:
+            self.bq_client.get_table(target_table_ref)
+        except Exception:
+            self.logger.info(
+                f"🔍 [BigQuery] Không tìm thấy bảng {target_table_name}, đang tạo mới..."
+            )
+            schema = [
+                bigquery.SchemaField("symbol", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("exchange", "STRING"),
+                bigquery.SchemaField("company_name", "STRING"),
+                bigquery.SchemaField("icb_code", "STRING"),
+                bigquery.SchemaField("com_type_code", "STRING"),
+                bigquery.SchemaField("type", "STRING"),
+                bigquery.SchemaField("status", "STRING"),
+            ]
+            table = bigquery.Table(target_table_ref, schema=schema)
+            self.bq_client.create_table(table)
+
+        # 2. Đẩy dữ liệu mới vào bảng tạm (Staging)
+        job_config = bigquery.LoadJobConfig(
+            write_disposition="WRITE_TRUNCATE",
+            source_format=bigquery.SourceFormat.PARQUET,
+        )
+        try:
+            # Ghi trực tiếp từ Polars sang Parquet trong RAM
+            bio = io.BytesIO()
+            df_companies.write_parquet(bio, compression="snappy")
+            bio.seek(0)
+
+            load_job = self.bq_client.load_table_from_file(
+                bio, staging_table_ref, job_config=job_config
+            )
+            load_job.result()
+
+            # 3. Thực thi câu lệnh MERGE để cập nhật dữ liệu
+            merge_query = f"""
+            MERGE `{target_table_ref}` T
+            USING `{staging_table_ref}` S
+            ON T.symbol = S.symbol
+            WHEN MATCHED THEN
+              UPDATE SET
+                exchange = COALESCE(S.exchange, T.exchange),
+                company_name = COALESCE(S.company_name, T.company_name),
+                icb_code = COALESCE(S.icb_code, T.icb_code),
+                com_type_code = COALESCE(S.com_type_code, T.com_type_code),
+                type = COALESCE(S.type, T.type),
+                status = 'active'
+            WHEN NOT MATCHED THEN
+              INSERT (symbol, exchange, company_name, icb_code, com_type_code, type, status)
+              VALUES (S.symbol, S.exchange, S.company_name, S.icb_code, S.com_type_code, S.type, S.status)
+            WHEN NOT MATCHED BY SOURCE THEN
+              UPDATE SET status = 'delisted'
+            """
+            query_job = self.bq_client.query(merge_query)
+            query_job.result()
+
+            self.logger.info("🎉 [BigQuery] Đồng bộ thông tin công ty thành công.")
+        except Exception as e:
+            self.logger.error(f"❌ [BigQuery] Gặp lỗi khi lưu thông tin công ty: {e}")
+            raise e
+        finally:
+            # 4. Dọn dẹp bảng tạm
+            try:
+                self.bq_client.delete_table(staging_table_ref, not_found_ok=True)
+            except Exception as clean_err:
+                self.logger.warning(
+                    f"❌ [BigQuery] Không thể dọn bảng tạm {staging_table_name}: {clean_err}"
+                )

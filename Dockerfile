@@ -1,30 +1,43 @@
-# Sử dụng Python 3.12 phiên bản rút gọn (slim) để nhẹ nhất có thể
-FROM python:3.12-slim
+# ==========================================
+# STAGE 1: BUILDER
+# ==========================================
+FROM python:3.12-slim AS builder
 
 # Ngăn Python tạo file cache và ép xuất log ra console ngay lập tức
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# 1. Tạo một tài khoản người dùng phi đặc quyền (non-root) tên là 'appuser'
-RUN useradd -m appuser
+# Tạo môi trường ảo (Virtual Environment)
+ENV VIRTUAL_ENV=/opt/venv
+RUN python -m venv $VIRTUAL_ENV
 
-# 2. Chuyển quyền điều khiển sang 'appuser' và tạo thư mục làm việc
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+# Cài đặt Python Dependencies vào venv
+COPY requirements.txt .
+
+# Cập nhật pip và cài đặt các thư viện từ requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install -v --no-cache-dir -r requirements.txt
+
+# ==========================================
+# STAGE 2: RUNTIME (IMAGE CUỐI CÙNG)
+# ==========================================
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# Tạo tài khoản người dùng phi đặc quyền (non-root)
+RUN useradd -m appuser
 USER appuser
 WORKDIR /home/appuser/app
 
-# 3. Tạo môi trường ảo (Virtual Environment) cho appuser
-ENV VIRTUAL_ENV=/home/appuser/venv
-RUN python -m venv $VIRTUAL_ENV
+# Copy toàn bộ môi trường ảo (đã có sẵn các pip packages) từ builder
+COPY --from=builder --chown=appuser:appuser /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
-# 4. Đưa môi trường ảo lên đầu biến PATH để hệ thống mặc định dùng nó
-ENV PATH="$VIRTUAL_ENV/bin:$PATH"
-
-# 5. Copy file requirements (cấp quyền cho appuser) và cài đặt thư viện
-COPY --chown=appuser:appuser requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
-
-# 6. Copy toàn bộ mã nguồn vào container
+# Copy toàn bộ mã nguồn vào container
 COPY --chown=appuser:appuser . .
 
 # Khai báo lệnh thực thi

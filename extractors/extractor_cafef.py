@@ -4,16 +4,16 @@ from __future__ import annotations
 
 import contextlib
 from datetime import datetime
-import gc
 import io
 import logging
+import os
 import random
+import tempfile
 import time
 from typing import Any, Iterator
 import zipfile
 
-import numpy as np
-import pandas as pd
+import polars as pl
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
@@ -21,7 +21,12 @@ from urllib3.util import Retry
 from config import Config
 from notifier import Notifier
 from storages import BaseStorage, get_storage
-from utils import normalize_exchange, setup_logger
+from utils import (
+    normalize_exchange,
+    setup_logger,
+    sanitize_price_columns,
+    build_price_invalid_mask,
+)
 
 
 class Downloader:
@@ -248,65 +253,63 @@ class DataProcessor:
             cols.append("source")
         return cols
 
-    def _clean_chunk(self, chunk: pd.DataFrame, exchange_name: str) -> pd.DataFrame:
-        """Làm sạch và downcast kiểu dữ liệu cho một phân đoạn (Chunk) bằng vector hóa.
+    def _validate_data_logic(self, lazy_df: pl.LazyFrame) -> pl.LazyFrame:
+        """Lọc các dòng vi phạm logic giá OHLCV bằng Polars Lazy Engine."""
+        return lazy_df.filter(~build_price_invalid_mask())
+
+    def _clean_chunk(self, chunk: pl.LazyFrame, exchange_name: str) -> pl.LazyFrame:
+        """Làm sạch và downcast kiểu dữ liệu cho một phân đoạn (Chunk) bằng vector hóa trên Lazy Engine.
 
         Args:
-            chunk (pd.DataFrame): Phân đoạn DataFrame thô đọc từ CSV.
+            chunk (pl.LazyFrame): Phân đoạn LazyFrame thô đọc từ CSV.
             exchange_name (str): Tên sàn giao dịch của phân đoạn.
 
         Returns:
-            pd.DataFrame: DataFrame đã xử lý lỗi logic, ép kiểu dữ liệu và lọc danh sách đen.
+            pl.LazyFrame: LazyFrame đã xử lý lỗi logic, ép kiểu dữ liệu và lọc danh sách đen.
         """
-        chunk = chunk.dropna(subset=["symbol", "trading_date"])
-        if chunk.empty:
-            return chunk
-
-        chunk = chunk.copy()
-        chunk["symbol"] = chunk["symbol"].astype(str).str.strip().str.upper()
+        chunk = chunk.drop_nulls(subset=["symbol", "trading_date"])
+        chunk = chunk.with_columns(
+            [
+                pl.col("symbol").cast(pl.String).str.strip_chars().str.to_uppercase(),
+                pl.lit(exchange_name).alias("exchange").cast(pl.Categorical),
+                pl.lit("cafef").alias("source"),
+            ]
+        )
 
         if self.blacklist:
-            chunk = chunk[~chunk["symbol"].isin(self.blacklist)]
-            if chunk.empty:
-                return chunk
+            chunk = chunk.filter(~pl.col("symbol").is_in(self.blacklist))
 
-        chunk["exchange"] = pd.Series(exchange_name, index=chunk.index).astype(
-            pd.CategoricalDtype(categories=["HoSE", "HNX", "UPCoM", "Unknown"])
+        # Làm sạch cột giá: thay Inf/NaN/Null và loại dòng null (dùng hàm dùng chung)
+        chunk = sanitize_price_columns(chunk)
+
+        # Nhân giá thô với hệ số quy đổi (để khớp đơn vị)
+        price_cols: list[str] = list(
+            ["open_price", "high_price", "low_price", "close_price"]
         )
-        chunk["source"] = "cafef"
-
-        # Loại bỏ các giá trị vô cực (inf) hoặc NaN trước khi nhân để tránh lỗi tràn số (overflow)
-        price_cols: list[str] = ["open_price", "high_price", "low_price", "close_price"]
-        chunk[price_cols] = chunk[price_cols].replace([np.inf, -np.inf], np.nan)
-        chunk = chunk.dropna(subset=price_cols)
-
-        # Nhân giá thô với hệ số quy đổi (thường là 1000) để khớp đơn vị
-        chunk[price_cols] *= Config.PRICE_MULTIPLIER
-
-        # Ép kiểu dữ liệu dung lượng nhỏ để tối ưu hóa bộ nhớ RAM
-        chunk[price_cols] = chunk[price_cols].round(2).astype("float32")
-        chunk["total_volume"] = chunk["total_volume"].astype("Int64")
-
-        # Áp dụng chốt chặn logic toán học để loại bỏ các dòng bị lỗi cấu trúc dữ liệu
-        valid_mask: pd.Series = (
-            (chunk[price_cols] >= 0).all(axis=1)
-            & (chunk["total_volume"] >= 0)
-            & (chunk["high_price"] >= chunk["low_price"])
-            & (chunk["high_price"] >= chunk["open_price"])
-            & (chunk["high_price"] >= chunk["close_price"])
-            & (chunk["low_price"] <= chunk["open_price"])
-            & (chunk["low_price"] <= chunk["close_price"])
+        chunk = chunk.with_columns(
+            [
+                (pl.col(col) * Config.PRICE_MULTIPLIER)
+                .round(2)
+                .cast(pl.Float32)
+                .alias(col)
+                for col in price_cols
+            ]
+            + [pl.col("total_volume").cast(pl.Int64)]
         )
-        return chunk[valid_mask].copy()
 
-    def process_zip_content(self, zip_data: io.BytesIO) -> pd.DataFrame:
-        """Trích xuất, xử lý làm sạch và hợp nhất các file CSV bên trong tệp ZIP.
+        # Lọc logic giá trên LazyFrame
+        chunk = self._validate_data_logic(chunk)
+
+        return chunk
+
+    def process_zip_content(self, zip_data: io.BytesIO) -> pl.DataFrame:
+        """Trích xuất, xử lý làm sạch và hợp nhất các file CSV bên trong tệp ZIP bằng LazyFrame.
 
         Args:
             zip_data (io.BytesIO): Luồng dữ liệu tệp ZIP nằm trong bộ nhớ RAM.
 
         Returns:
-            pd.DataFrame: DataFrame hoàn chỉnh đã chuẩn hóa toàn bộ dữ liệu.
+            pl.DataFrame: DataFrame hoàn chỉnh đã chuẩn hóa toàn bộ dữ liệu.
         """
         cols_order: list[str] = self._get_column_names(
             include_exchange=False, include_source=False
@@ -315,80 +318,98 @@ class DataProcessor:
             include_exchange=True, include_source=True
         )
 
-        csv_dtypes: dict[str, str] = {
-            "symbol": "str",
-            "open_price": "float32",
-            "high_price": "float32",
-            "low_price": "float32",
-            "close_price": "float32",
-            "total_volume": "float32",
+        lazy_dfs: list[pl.LazyFrame] = []
+
+        # Định nghĩa trước cấu trúc DataFrame rỗng để fallback khi lỗi giải nén
+        schema = {
+            "symbol": pl.String,
+            "trading_date": pl.Date,
+            "open_price": pl.Float32,
+            "high_price": pl.Float32,
+            "low_price": pl.Float32,
+            "close_price": pl.Float32,
+            "total_volume": pl.Int64,
+            "exchange": pl.Categorical,
+            "source": pl.String,
         }
 
-        dfs: list[pd.DataFrame] = []
-        with zipfile.ZipFile(zip_data) as z:
-            csv_files: list[str] = [
-                name for name in z.namelist() if name.endswith(".csv")
-            ]
-            if not csv_files:
-                self.logger.warning("📭 Tệp Zip trống hoặc không chứa file '.csv' nào.")
-                return pd.DataFrame(columns=final_cols_order)
+        try:
+            with zipfile.ZipFile(zip_data) as z:
+                csv_files: list[str] = [
+                    name for name in z.namelist() if name.endswith(".csv")
+                ]
 
-            for name in csv_files:
-                self.logger.info(
-                    f"📂 Đang trích xuất & xử lý stream sàn: [yellow]{name}[/yellow]"
-                )
-                detected_exchange: str = normalize_exchange(name)
+                if not csv_files:
+                    self.logger.warning(
+                        "📭 Tệp Zip trống hoặc không chứa file '.csv' nào."
+                    )
+                    return pl.DataFrame(schema=schema).select(final_cols_order)
 
-                with z.open(name) as f:
-                    with io.TextIOWrapper(f, encoding="utf-8") as text_stream:
+                # Sử dụng TemporaryDirectory để giải nén file CSV ra đĩa tạm thời giúp Polars scan_csv dạng lazy
+                # Đặt dir="." để tạo thư mục tạm trong thư mục làm việc hiện tại của dự án
+                with tempfile.TemporaryDirectory(dir=".") as temp_dir:
+                    for name in csv_files:
+                        self.logger.info(
+                            f"📂 Đang giải nén và quét Lazy cho sàn: [yellow]{name}[/yellow]"
+                        )
+                        detected_exchange: str = normalize_exchange(name)
+
                         try:
-                            # Phân tích định dạng ngày ngay ở C-Engine để tối đa hóa tốc độ tải dữ liệu
-                            chunks: pd.io.parsers.TextFileReader = pd.read_csv(
-                                text_stream,
-                                header=0,
-                                names=cols_order,
-                                dtype=csv_dtypes,
-                                engine="c",
-                                on_bad_lines="skip",
-                                chunksize=Config.CHUNK_SIZE,
-                                parse_dates=[1],
-                                date_format="%Y%m%d",
+                            # Giải nén file CSV ra đĩa tạm thời
+                            extracted_path: str = z.extract(name, path=temp_dir)
+
+                            # Sử dụng scan_csv để đọc lazy thực sự giúp tối ưu hóa bộ nhớ
+                            lazy_df = pl.scan_csv(
+                                extracted_path,
+                                has_header=False,
+                                new_columns=cols_order,
+                                schema_overrides={
+                                    "symbol": pl.String,
+                                    "trading_date": pl.String,
+                                    "open_price": pl.Float32,
+                                    "high_price": pl.Float32,
+                                    "low_price": pl.Float32,
+                                    "close_price": pl.Float32,
+                                    "total_volume": pl.Float32,
+                                },
+                                ignore_errors=True,
                             )
-                            for chunk in chunks:
-                                clean_df: pd.DataFrame = self._clean_chunk(
-                                    chunk, detected_exchange
+
+                            # Parse trading_date
+                            lazy_df = lazy_df.with_columns(
+                                pl.col("trading_date").str.to_date(
+                                    "%Y%m%d", strict=False
                                 )
-                                if not clean_df.empty:
-                                    dfs.append(clean_df)
-                                del chunk
-                        except pd.errors.EmptyDataError:
-                            self.logger.warning(
-                                f"⚠️ [CafeF] Tệp CSV '{name}' trống hoặc chỉ chứa tiêu đề. Bỏ qua."
                             )
 
-        if not dfs:
-            return pd.DataFrame(columns=final_cols_order)
+                            # Đưa vào pipeline làm sạch
+                            lazy_df = self._clean_chunk(lazy_df, detected_exchange)
+                            lazy_dfs.append(lazy_df)
+                        except Exception as e:
+                            self.logger.warning(
+                                f"⚠️ [CafeF] Tệp CSV '{name}' trống hoặc lỗi: {e}. Bỏ qua."
+                            )
 
-        self.logger.info("🧱 Đang gộp các phân đoạn dữ liệu lịch sử và tối ưu RAM...")
-        result_df: pd.DataFrame = pd.concat(dfs, ignore_index=True)
+                    if not lazy_dfs:
+                        return pl.DataFrame(schema=schema).select(final_cols_order)
 
-        del dfs
-        gc.collect()
+                    self.logger.info("🧱 Đang thực thi Out-of-Core Processing để gộp dữ liệu...")
 
-        result_df["exchange"] = result_df["exchange"].astype(
-            pd.CategoricalDtype(categories=["HoSE", "HNX", "UPCoM", "Unknown"])
-        )
-        result_df["symbol"] = result_df["symbol"].astype("category")
-
-        # Sắp xếp và chỉ giữ lại bản ghi giao dịch mới nhất của ngày nếu có trùng lặp
-        result_df.sort_values(
-            by=["symbol", "trading_date"], inplace=True, ignore_index=True
-        )
-        result_df.drop_duplicates(
-            subset=["symbol", "trading_date"], keep="last", inplace=True
-        )
-
-        return result_df[final_cols_order]
+                    # Gọi collect() bên trong block 'with' để các file CSV tạm thời vẫn tồn tại khi Polars đọc dữ liệu
+                    result_df = (
+                        pl.concat(lazy_dfs)
+                        .sort(["symbol", "trading_date"])
+                        .unique(subset=["symbol", "trading_date"], keep="last")
+                        .select(final_cols_order)
+                        .collect(engine="streaming")
+                    )
+                    return result_df
+        except zipfile.BadZipFile as e:
+            self.logger.error(f"❌ Tệp ZIP tải về bị lỗi cấu trúc (BadZipFile): {e}")
+            return pl.DataFrame(schema=schema).select(final_cols_order)
+        except Exception as e:
+            self.logger.error(f"❌ Gặp sự cố không mong muốn khi đọc tệp ZIP: {e}")
+            return pl.DataFrame(schema=schema).select(final_cols_order)
 
 
 class CafeFExtractorETL:
@@ -402,15 +423,20 @@ class CafeFExtractorETL:
         self,
         logger_name: str = Config.DEFAULT_LOGGER_NAME,
         storage: BaseStorage | None = None,
+        logger: logging.Logger | None = None,
+        notifier: Notifier | None = None,
     ) -> None:
         """Khởi tạo đối tượng ETL và cấu hình kết nối các phân lớp.
 
         Args:
             logger_name (str): Tên Logger hệ thống dùng chung.
             storage (BaseStorage | None): Đối tượng Storage chia sẻ kết nối GCP.
+            logger (logging.Logger | None): Logger hệ thống bên ngoài truyền vào.
+            notifier (Notifier | None): Đối tượng Notifier dùng chung.
         """
-        self.logger = setup_logger(logger_name)
+        self.logger = logger or setup_logger(logger_name)
         self.storage = storage or get_storage(Config.DEPLOYMENT_ENV, self.logger)
+        self.notifier = notifier or Notifier(self.logger)
         self.processor = DataProcessor(self.logger, storage=self.storage)
 
     def run(
@@ -419,7 +445,7 @@ class CafeFExtractorETL:
         is_raw: bool = True,
         partition: bool = False,
         save_checkpoint: bool = True,
-    ) -> pd.DataFrame | None:
+    ) -> pl.DataFrame | None:
         """Thực thi quy trình ETL tải, xử lý làm sạch và nạp dữ liệu CafeF.
 
         Args:
@@ -429,7 +455,7 @@ class CafeFExtractorETL:
             save_checkpoint (bool): Có cập nhật trạng thái EOD checkpoint lên GCS hay không.
 
         Returns:
-            pd.DataFrame | None: DataFrame kết quả nếu chạy hoàn tất thành công, ngược lại trả về None.
+            pl.DataFrame | None: DataFrame kết quả nếu chạy hoàn tất thành công, ngược lại trả về None.
         """
         suffix: str = "raw" if is_raw else "adj"
         self.logger.info(
@@ -447,7 +473,7 @@ class CafeFExtractorETL:
                     if save_checkpoint:
                         try:
                             date_str: str = date_ref.strftime("%Y-%m-%d")
-                            Notifier(self.logger).send_alert(
+                            self.notifier.send_alert(
                                 f"Lỗi chạy CafeF [{suffix.upper()}]",
                                 f"Không tải được tệp tin ZIP từ máy chủ CafeF cho ngày {date_str}.",
                             )
@@ -458,23 +484,20 @@ class CafeFExtractorETL:
                     return None
 
                 try:
-                    df: pd.DataFrame = self.processor.process_zip_content(zip_stream)
+                    df: pl.DataFrame = self.processor.process_zip_content(zip_stream)
 
                     if partition:
                         # Chỉ lấy dữ liệu đúng ngày cần chạy để nạp phân mảnh
-                        df = df[
-                            pd.to_datetime(df["trading_date"]).dt.date
-                            == date_ref.date()
-                        ].copy()
+                        df = df.filter(pl.col("trading_date") == date_ref.date())
 
-                    if df.empty:
+                    if df.is_empty():
                         self.logger.error(
                             "🛑 Pipeline kết thúc sớm do tập dữ liệu sau khi làm sạch trống rỗng."
                         )
                         if save_checkpoint:
                             try:
                                 date_str: str = date_ref.strftime("%Y-%m-%d")
-                                Notifier(self.logger).send_alert(
+                                self.notifier.send_alert(
                                     f"Lỗi chạy CafeF [{suffix.upper()}]",
                                     f"Tập dữ liệu sau khi làm sạch trống rỗng cho ngày {date_str}.",
                                 )
@@ -515,15 +538,15 @@ class CafeFExtractorETL:
                         self.storage.save_checkpoint(df)
 
                     self.logger.info(
-                        f"🏁 Pipeline hoàn thành xuất sắc! Tổng số dòng xử lý: {df.shape[0]:,}"
+                        f"🏁 Pipeline hoàn thành xuất sắc! Tổng số dòng xử lý: {df.height:,}"
                     )
                     if save_checkpoint:
                         try:
-                            Notifier(self.logger).send_message(
+                            self.notifier.send_message(
                                 f"✅ <b>BÁO CÁO PIPELINE CAFEF</b>\n"
                                 f"📅 <b>Ngày chạy:</b> {date_ref.strftime('%Y-%m-%d')}\n"
                                 f"📊 <b>Loại dữ liệu:</b> {'Giá thô (Raw)' if is_raw else 'Giá điều chỉnh (Adj)'}\n"
-                                f"📈 <b>Dòng xử lý:</b> {df.shape[0]:,} dòng\n"
+                                f"📈 <b>Dòng xử lý:</b> {df.height:,} dòng\n"
                                 f"✨ <b>Trạng thái:</b> Hoàn thành xuất sắc.\n"
                                 f"⏰ <i>Thời gian: {datetime.now(Config.VN_TZ).strftime('%Y-%m-%d %H:%M:%S')}</i>"
                             )
@@ -539,7 +562,7 @@ class CafeFExtractorETL:
                     )
                     if save_checkpoint:
                         try:
-                            Notifier(self.logger).send_alert(
+                            self.notifier.send_alert(
                                 f"Sập Hệ thống CafeF [{suffix.upper()}]",
                                 f"{type(e).__name__}: {str(e)}",
                             )

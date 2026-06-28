@@ -1,12 +1,14 @@
 """Module cung cấp các hàm tiện ích hỗ trợ định dạng logging và bộ giới hạn tần suất API (Rate Limiter)."""
 
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import datetime
 import json
 import logging
 import os
 import time
-from typing import Any, Callable
+from typing import Any
 
+import polars as pl
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.text import Text
@@ -59,7 +61,7 @@ class GCPJSONFormatter(logging.Formatter):
             "severity": severity,
             "message": message,
             "logger.name": record.name,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(datetime.UTC).isoformat(),
         }
 
         if record.exc_info:
@@ -76,10 +78,10 @@ def setup_logger(name: str, level: int = logging.INFO) -> logging.Logger:
 
     Args:
         name (str): Tên của đối tượng Logger cần tạo.
-        level (int): Cấp độ ghi nhận vết log (mặc định là logging.INFO).
+        level (int): Cấp độ ghi vết log (mặc định logging.INFO).
 
     Returns:
-        logging.Logger: Logger đã được cấu hình phù hợp với môi trường thực thi (Local / Cloud Run).
+        logging.Logger: Logger đã được cấu hình phù hợp.
     """
     logger: logging.Logger = logging.getLogger(name)
     logger.setLevel(level)
@@ -119,10 +121,10 @@ def normalize_exchange(exchange_code: str) -> str:
     """Chuẩn hóa tên sàn giao dịch chứng khoán Việt Nam về dạng thống nhất.
 
     Args:
-        exchange_code (str): Tên sàn hoặc mã sàn chưa được chuẩn hóa từ nguồn dữ liệu.
+        exchange_code (str): Tên sàn từ nguồn dữ liệu.
 
     Returns:
-        str: Tên sàn chuẩn hóa thuộc một trong các nhóm: "HoSE", "HNX", "UPCoM", "Unknown".
+        str: Sàn chuẩn hóa: "HoSE", "HNX", "UPCoM", "Unknown".
     """
     clean_code: str = str(exchange_code).strip().upper()
     if "HSX" in clean_code or "HOSE" in clean_code:
@@ -155,10 +157,10 @@ class SmartRateLimiter:
         """Khởi tạo bộ giới hạn tốc độ yêu cầu API.
 
         Args:
-            logger (logging.Logger): Đối tượng Logger dùng để theo dõi trạng thái.
-            limit (int): Ngưỡng số lượng cuộc gọi API tối đa trong một chu kỳ window.
-            window (float): Độ dài khung thời gian làm mát tính bằng giây.
-            micro_sleep (float): Độ trễ tối thiểu bắt buộc giữa hai yêu cầu liên tiếp.
+            logger (logging.Logger): Logger theo dõi trạng thái.
+            limit (int): Lượt gọi tối đa trong window.
+            window (float): Độ dài khung thời gian làm mát (giây).
+            micro_sleep (float): Độ trễ tối thiểu giữa 2 req.
         """
         self.logger = logger
         self.limit = limit
@@ -231,3 +233,83 @@ class SmartRateLimiter:
         """Khởi động lại bộ đếm cuộc gọi API cho chu kỳ làm mát mới."""
         self.count = 0
         self.start_time = time.time()
+
+
+def get_exchange_normalization_expr(col_name: str) -> pl.Expr:
+    """Trả về biểu thức Polars để chuẩn hóa tên sàn giao dịch chứng khoán Việt Nam.
+
+    Args:
+        col_name (str): Tên cột chứa thông tin sàn giao dịch.
+
+    Returns:
+        pl.Expr: Biểu thức chuẩn hóa Polars.
+    """
+    clean_col: pl.Expr = (
+        pl.col(col_name).cast(pl.String).str.strip_chars().str.to_uppercase()
+    )
+    return (
+        pl.when(clean_col.str.contains("HSX|HOSE"))
+        .then(pl.lit("HoSE"))
+        .when(clean_col.str.contains("UPCOM"))
+        .then(pl.lit("UPCoM"))
+        .when(clean_col.str.contains("HNX"))
+        .then(pl.lit("HNX"))
+        .otherwise(pl.lit("Unknown"))
+        .alias(col_name)
+    )
+
+
+# Danh sách cột giá tiêu chuẩn được dùng chung trong toàn bộ pipeline ETL.
+_PRICE_COLS: tuple[str, ...] = ("open_price", "high_price", "low_price", "close_price")
+
+
+def sanitize_price_columns(
+    df: pl.DataFrame | pl.LazyFrame,
+) -> pl.DataFrame | pl.LazyFrame:
+    """Làm sạch các cột giá OHLCV bằng cách thay Inf/NaN/Null thành None và loại null.
+
+    Hàm dùng chung cho cả ``pl.DataFrame`` và ``pl.LazyFrame``,
+    tránh copy-paste logic giữa các module extractor.
+
+    Args:
+        df (pl.DataFrame | pl.LazyFrame): DataFrame hoặc LazyFrame cần làm sạch.
+
+    Returns:
+        pl.DataFrame | pl.LazyFrame: Frame đã thay thế Inf/NaN/Null và loại bỏ dòng null giá.
+    """
+    sanitize_exprs: list[pl.Expr] = [
+        pl.when(
+            pl.col(col).is_infinite() | pl.col(col).is_nan() | pl.col(col).is_null()
+        )
+        .then(None)
+        .otherwise(pl.col(col))
+        .alias(col)
+        for col in _PRICE_COLS
+    ]
+    return df.with_columns(sanitize_exprs).drop_nulls(subset=list(_PRICE_COLS))
+
+
+def build_price_invalid_mask() -> pl.Expr:
+    """Trả về biểu thức Polars lọc các dòng vi phạm logic OHLCV hoặc có giá trị âm/bằng 0.
+
+    Logic hợp lệ cần thỏa mãn đồng thời:
+    - high >= low, high >= open, high >= close
+    - low <= open, low <= close
+    - open, high, low, close > 0
+    - total_volume >= 0
+
+    Returns:
+        pl.Expr: Biểu thức boolean True cho các dòng **không hợp lệ** (để dùng với ``filter(~mask)``).
+    """
+    return (
+        (pl.col("high_price") < pl.col("low_price"))
+        | (pl.col("high_price") < pl.col("open_price"))
+        | (pl.col("high_price") < pl.col("close_price"))
+        | (pl.col("low_price") > pl.col("open_price"))
+        | (pl.col("low_price") > pl.col("close_price"))
+        | (pl.col("open_price") <= 0)
+        | (pl.col("high_price") <= 0)
+        | (pl.col("low_price") <= 0)
+        | (pl.col("close_price") <= 0)
+        | (pl.col("total_volume") < 0)
+    )

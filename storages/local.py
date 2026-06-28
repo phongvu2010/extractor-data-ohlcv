@@ -7,9 +7,9 @@ import gc
 import logging
 import os
 import time
-from typing import Any, Callable
+from typing import Any
 
-import pandas as pd
+import polars as pl
 from sqlalchemy import (
     BigInteger,
     Column,
@@ -18,19 +18,25 @@ from sqlalchemy import (
     Index,
     Integer,
     JSON,
+    MetaData,
     Numeric,
     String,
+    Table,
     UniqueConstraint,
     bindparam,
     create_engine,
     text,
 )
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.engine import Engine
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from config import Config
 from .base import BaseStorage
 
-Base = declarative_base()
+
+class Base(DeclarativeBase):
+    """Base class cho tất cả ORM models (SQLAlchemy 2.0 style)."""
 
 
 class IcbIndustryModel(Base):
@@ -55,7 +61,9 @@ class CompanyModel(Base):
     exchange = Column(String(10), nullable=False)
     company_name = Column(String(255), nullable=False)
     icb_code = Column(
-        String(10), ForeignKey("icb_industries.icb_code", ondelete="SET NULL"), nullable=True
+        String(10),
+        ForeignKey("icb_industries.icb_code", ondelete="SET NULL"),
+        nullable=True,
     )
     com_type_code = Column(String(20), nullable=True)
     type = Column(String(20), nullable=True)
@@ -134,11 +142,39 @@ class PipelineStateModel(Base):
     value = Column(JSON, nullable=False)
 
 
+# Tuần tự các cột chuẩn được lưu vào bảng OHLCV trong PostgreSQL.
+# Khai báo một lần, dùng chung cho mọi method đọc-ghi Parquet → DB.
+_OHLCV_STORAGE_COLS: tuple[str, ...] = (
+    "symbol",
+    "trading_date",
+    "open_price",
+    "high_price",
+    "low_price",
+    "close_price",
+    "total_volume",
+    "exchange",
+    "source",
+)
+
+# Danh sách trắng các bảng hợp lệ được phép thao tác trong SQL động.
+# Ngăn chặn SQL Injection qua f-string khi tên bảng được truyền vào làm tham số.
+_ALLOWED_TABLE_NAMES: frozenset[str] = frozenset(
+    {
+        "raw_price",
+        "adj_price",
+        "corporate_events",
+        "icb_industries",
+        "companies",
+        "pipeline_state",
+    }
+)
+
+
 class LocalStorage(BaseStorage):
     """Bộ lưu trữ dữ liệu cục bộ dùng PostgreSQL (TimescaleDB) và lưu file Parquet cục bộ."""
 
-    engine: Any
-    Session: Any
+    engine: Engine
+    Session: sessionmaker
 
     def __init__(self, logger: logging.Logger) -> None:
         """Khởi tạo kết nối cục bộ PostgreSQL, kiểm tra TimescaleDB và di cư (migrate) các bảng.
@@ -190,6 +226,8 @@ class LocalStorage(BaseStorage):
                 time.sleep(retry_delay)
 
         self.Session = sessionmaker(bind=self.engine)
+        self._cached_metadata = MetaData()
+        self._cached_tables: dict[str, Table] = {}
         self.init_db()
 
     def init_db(self) -> None:
@@ -251,17 +289,13 @@ class LocalStorage(BaseStorage):
                         self.logger.info(
                             "✨ [TimescaleDB] Thiết lập chính sách nén (30 ngày) cho 'raw_price'..."
                         )
-                        conn.execute(
-                            text(
-                                """
+                        conn.execute(text("""
                                 ALTER TABLE raw_price SET (
                                     timescaledb.compress,
                                     timescaledb.compress_segmentby = 'symbol',
                                     timescaledb.compress_orderby = 'trading_date DESC'
                                 );
-                                """
-                            )
-                        )
+                                """))
                         conn.execute(
                             text(
                                 "SELECT add_compression_policy('raw_price', INTERVAL '30 days', if_not_exists => TRUE);"
@@ -294,17 +328,13 @@ class LocalStorage(BaseStorage):
                         self.logger.info(
                             "✨ [TimescaleDB] Thiết lập chính sách nén (30 ngày) cho 'adj_price'..."
                         )
-                        conn.execute(
-                            text(
-                                """
+                        conn.execute(text("""
                                 ALTER TABLE adj_price SET (
                                     timescaledb.compress,
                                     timescaledb.compress_segmentby = 'symbol',
                                     timescaledb.compress_orderby = 'trading_date DESC'
                                 );
-                                """
-                            )
-                        )
+                                """))
                         conn.execute(
                             text(
                                 "SELECT add_compression_policy('adj_price', INTERVAL '30 days', if_not_exists => TRUE);"
@@ -321,44 +351,109 @@ class LocalStorage(BaseStorage):
             self.logger.error(f"🛑 [LocalStorage] Lỗi khởi tạo database: {e}")
             raise e
 
-    def _create_upsert_method(
-        self, index_elements: list[str]
-    ) -> Callable[[Any, Any, list[str], Any], None]:
-        """Tạo hàm helper cho pandas to_sql thực hiện Upsert (INSERT ... ON CONFLICT DO UPDATE).
+    def _validate_table_name(self, table_name: str) -> str:
+        """Kiểm tra tên bảng nằm trong danh sách trắng để ngăn chặn SQL Injection.
 
         Args:
-            index_elements (list[str]): Danh sách các cột khóa chính/unique dùng để xác định conflict.
+            table_name (str): Tên bảng cần kiểm tra.
 
         Returns:
-            Callable: Hàm callback method tương thích với pandas to_sql.
+            str: Tên bảng đã xác thực (trả về nguyên vẹn nếu hợp lệ).
+
+        Raises:
+            ValueError: Nếu tên bảng không nằm trong danh sách cho phép.
         """
-        from sqlalchemy.dialects.postgresql import insert
+        if table_name not in _ALLOWED_TABLE_NAMES:
+            raise ValueError(
+                f"Tên bảng '{table_name}' không nằm trong danh sách cho phép: "
+                f"{sorted(_ALLOWED_TABLE_NAMES)}. Từ chối thực thi SQL."
+            )
+        return table_name
 
-        def method(table: Any, conn: Any, keys: list[str], data_iter: Any) -> None:
-            data = [dict(zip(keys, row)) for row in data_iter]
-            if not data:
-                return
-            insert_stmt = insert(table.table).values(data)
-            update_cols = {
-                c.name: c
-                for c in insert_stmt.excluded
-                if c.name not in index_elements and c.name != "id"
-            }
-            if not update_cols:
-                upsert_stmt = insert_stmt.on_conflict_do_nothing(
-                    index_elements=index_elements
-                )
-            else:
-                upsert_stmt = insert_stmt.on_conflict_do_update(
-                    index_elements=index_elements, set_=update_cols
-                )
-            conn.execute(upsert_stmt)
+    def _select_ohlcv_cols(self, df: pl.DataFrame) -> pl.DataFrame:
+        """Chọn chỉ các cột OHLCV hợp lệ từ DataFrame, bỏ qua cột ngoài schema.
 
-        return method
+        Sử dụng hằng số ``_OHLCV_STORAGE_COLS`` làm nguồn sự thật duy nhất cho thứ tự cột.
+        Các cột như ``reference_price``, ``average_price`` sẽ bị loại bỏ tự động.
+
+        Args:
+            df (pl.DataFrame): DataFrame gốc cần lọc cột.
+
+        Returns:
+            pl.DataFrame: DataFrame chỉ gồm các cột nằm trong ``_OHLCV_STORAGE_COLS``
+                và có mặt trong DataFrame.
+        """
+        cols = [c for c in _OHLCV_STORAGE_COLS if c in df.columns]
+        return df.select(cols)
+
+    def _get_table_schema(self, table_name: str) -> Table:
+        """Lấy schema cấu trúc bảng từ cache hoặc autoload từ cơ sở dữ liệu.
+
+        Args:
+            table_name (str): Tên bảng cần lấy schema.
+
+        Returns:
+            Table: Đối tượng Table tương ứng của SQLAlchemy.
+        """
+        self._validate_table_name(table_name)
+        if table_name not in self._cached_tables:
+            self._cached_tables[table_name] = Table(
+                table_name, self._cached_metadata, autoload_with=self.engine
+            )
+        return self._cached_tables[table_name]
+
+    def _upsert_polars_to_pg(
+        self,
+        df: pl.DataFrame,
+        table_name: str,
+        index_elements: list[str],
+        chunk_size: int | None = None,
+    ) -> None:
+        """
+        Thực hiện bulk upsert trực tiếp từ Polars sang PostgreSQL, không qua Pandas.
+        Giữ nguyên tính chất Idempotent thông qua ON CONFLICT DO UPDATE.
+        """
+        if df.is_empty():
+            return
+
+        if chunk_size is None:
+            chunk_size = Config.DB_UPSERT_CHUNK_SIZE
+
+        # Lấy cấu trúc bảng từ cache để tối ưu hóa hiệu năng
+        table = self._get_table_schema(table_name)
+
+        # Mở một Transaction duy nhất cho tất cả các chunk để tối ưu hiệu năng
+        with self.engine.begin() as conn:
+            # Chia nhỏ DataFrame để nạp vào DB, tối ưu RAM
+            for i in range(0, df.height, chunk_size):
+                chunk = df.slice(i, chunk_size)
+
+                # to_dicts() của Polars rất nhanh và tự động map kiểu Date của Polars sang datetime.date của Python
+                data_dicts = chunk.to_dicts()
+
+                insert_stmt = insert(table).values(data_dicts)
+
+                # Lọc ra các cột cần cập nhật (loại trừ khóa chính và cột id tự tăng nếu có)
+                update_cols = {
+                    c.name: c
+                    for c in insert_stmt.excluded
+                    if c.name not in index_elements and c.name != "id"
+                }
+
+                if not update_cols:
+                    upsert_stmt = insert_stmt.on_conflict_do_nothing(
+                        index_elements=index_elements
+                    )
+                else:
+                    upsert_stmt = insert_stmt.on_conflict_do_update(
+                        index_elements=index_elements, set_=update_cols
+                    )
+
+                conn.execute(upsert_stmt)
 
     def save_parquet(
         self,
-        df: pd.DataFrame,
+        df: pl.DataFrame,
         date_ref: datetime,
         suffix: str = "raw",
         partition: bool = False,
@@ -366,7 +461,7 @@ class LocalStorage(BaseStorage):
         """Lưu trữ dữ liệu nén Parquet cục bộ và trả về đường dẫn.
 
         Args:
-            df (pd.DataFrame): DataFrame chứa dữ liệu cần lưu trữ.
+            df (pl.DataFrame): DataFrame chứa dữ liệu cần lưu trữ.
             date_ref (datetime): Đối tượng mốc thời gian để làm tiền đề
                 đặt tên thư mục/file.
             suffix (str, optional): Hậu tố phân loại dữ liệu (ví dụ: "raw", "adj").
@@ -381,15 +476,18 @@ class LocalStorage(BaseStorage):
         Raises:
             Exception: Lỗi phát sinh trong quá trình ghi file lên đĩa.
         """
-        if df is None or df.empty:
+        if df is None or df.is_empty():
             return None
 
         # Tối ưu: Lấy ngày thực tế lớn nhất từ cột trading_date
         # để đặt tên thư mục/file nếu có
         if "trading_date" in df.columns:
-            max_date: Any = pd.to_datetime(df["trading_date"]).max()
-            if not pd.isna(max_date):
-                date_ref = max_date
+            max_date: Any = df["trading_date"].max()
+            if max_date is not None:
+                if isinstance(max_date, date):
+                    date_ref = datetime.combine(max_date, datetime.min.time())
+                else:
+                    date_ref = max_date
 
         gcs_path: str
         if partition:
@@ -403,63 +501,59 @@ class LocalStorage(BaseStorage):
             )
         else:
             gcs_path = (
-                f"{Config.GCS_PARQUET_PREFIX}/{suffix}/" "cafef_historical_all.parquet"
+                f"{Config.GCS_PARQUET_PREFIX}/{suffix}/cafef_historical_all.parquet"
             )
 
         local_path: str = os.path.join("data", gcs_path)
         try:
             self.logger.info(
-                f"💾 [Local Disk] Đang ghi dữ liệu nén Parquet cục bộ: " f"{local_path}"
+                f"💾 [Local Disk] Đang ghi dữ liệu nén Parquet cục bộ: {local_path}"
             )
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
-            df.to_parquet(local_path, index=False, compression="snappy")
+            df.write_parquet(local_path, compression="snappy")
             self.logger.info(
                 f"🎉 [Local Disk] File lưu trữ thành công tại: {local_path}"
             )
             return local_path
         except Exception as e:
             self.logger.error(
-                f"❌ [Local Disk] Lỗi trong quá trình ghi file " f"Parquet cục bộ: {e}"
+                f"❌ [Local Disk] Lỗi trong quá trình ghi file Parquet cục bộ: {e}"
             )
             raise e
 
     def save_symbol_history(
-        self, df: pd.DataFrame, symbol: str, suffix: str = "adj"
+        self, df: pl.DataFrame, symbol: str, suffix: str = "adj"
     ) -> None:
         """Lưu trữ toàn bộ lịch sử giá của một mã cổ phiếu cụ thể ra file Parquet cục bộ.
 
         Args:
-            df (pd.DataFrame): DataFrame chứa dữ liệu lịch sử giá của mã cổ phiếu.
+            df (pl.DataFrame): DataFrame chứa dữ liệu lịch sử giá của mã cổ phiếu.
             symbol (str): Mã cổ phiếu (ví dụ: "FPT", "VIC").
             suffix (str, optional): Hậu tố phân loại thư mục lưu trữ. Mặc định là "adj".
 
         Raises:
             Exception: Lỗi phát sinh trong quá trình tạo thư mục hoặc ghi file Parquet.
         """
-        if df is None or df.empty:
+        if df is None or df.is_empty():
             return
 
         gcs_path: str = (
-            f"{Config.GCS_PARQUET_PREFIX}/{suffix}/reloaded/"
-            f"{symbol.upper()}.parquet"
+            f"{Config.GCS_PARQUET_PREFIX}/{suffix}/reloaded/{symbol.upper()}.parquet"
         )
         local_path: str = os.path.join("data", gcs_path)
 
         try:
             self.logger.info(
-                f"💾 [Local Disk] Đang ghi lịch sử cho mã {symbol.upper()} "
-                f"tại: {local_path}"
+                f"💾 [Local Disk] Đang ghi lịch sử cho mã {symbol.upper()} tại: {local_path}"
             )
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
-            df.to_parquet(local_path, index=False, compression="snappy")
+            df.write_parquet(local_path, compression="snappy")
             self.logger.info(
-                f"🎉 [Local Disk] File lịch sử mã {symbol.upper()} "
-                "lưu trữ thành công."
+                f"🎉 [Local Disk] File lịch sử mã {symbol.upper()} lưu trữ thành công."
             )
         except Exception as e:
             self.logger.error(
-                f"❌ [Local Disk] Lỗi khi ghi file lịch sử cho mã "
-                f"{symbol.upper()} cục bộ: {e}"
+                f"❌ [Local Disk] Lỗi khi ghi file lịch sử cho mã {symbol.upper()} cục bộ: {e}"
             )
             raise e
 
@@ -481,36 +575,22 @@ class LocalStorage(BaseStorage):
             f"vào bảng {table_name}..."
         )
         try:
-            df = pd.read_parquet(path)
-            if df.empty:
+            df = pl.read_parquet(path)
+            if df.is_empty():
                 return
 
+            # Ép kiểu chuẩn ngày tháng trên Polars (không cần dùng apply của Pandas nữa)
             if "trading_date" in df.columns:
-                df["trading_date"] = pd.to_datetime(df["trading_date"]).dt.date
+                df = df.with_columns(pl.col("trading_date").cast(pl.Date))
 
             # Loại bỏ các cột không thuộc schema lưu trữ Postgres
-            # (ví dụ: reference_price, average_price)
-            valid_cols = [
-                "symbol",
-                "trading_date",
-                "open_price",
-                "high_price",
-                "low_price",
-                "close_price",
-                "total_volume",
-                "exchange",
-                "source",
-            ]
-            df_write = df[[c for c in valid_cols if c in df.columns]].copy()
+            df_write = self._select_ohlcv_cols(df)
 
-            upsert_method = self._create_upsert_method(["symbol", "trading_date"])
-            df_write.to_sql(
-                name=table_name,
-                con=self.engine,
-                if_exists="append",
-                index=False,
-                method=upsert_method,
-                chunksize=5000,
+            # Gọi hàm _upsert_polars_to_pg
+            self._upsert_polars_to_pg(
+                df=df_write,
+                table_name=table_name,
+                index_elements=["symbol", "trading_date"],
             )
             self.logger.info(
                 f"🎉 [Postgres] Đồng bộ thành công vào bảng {table_name} "
@@ -518,7 +598,7 @@ class LocalStorage(BaseStorage):
             )
         except Exception as e:
             self.logger.error(
-                f"❌ [Postgres] Lỗi đồng bộ phân vùng vào bảng " f"{table_name}: {e}"
+                f"❌ [Postgres] Lỗi đồng bộ phân vùng vào bảng {table_name}: {e}"
             )
             raise e
 
@@ -541,45 +621,29 @@ class LocalStorage(BaseStorage):
         try:
             for symbol in symbols:
                 gcs_path: str = (
-                    f"{Config.GCS_PARQUET_PREFIX}/adj/reloaded/"
-                    f"{symbol.upper()}.parquet"
+                    f"{Config.GCS_PARQUET_PREFIX}/adj/reloaded/{symbol.upper()}.parquet"
                 )
                 local_path: str = os.path.join("data", gcs_path)
                 if not os.path.exists(local_path):
                     self.logger.warning(
-                        f"⚠️ [Postgres] Không thấy file lịch sử "
-                        f"{local_path} để sync."
+                        f"⚠️ [Postgres] Không thấy file lịch sử {local_path} để sync."
                     )
                     continue
 
-                df = pd.read_parquet(local_path)
-                if df.empty:
+                df = pl.read_parquet(local_path)
+                if df.is_empty():
                     continue
 
                 if "trading_date" in df.columns:
-                    df["trading_date"] = pd.to_datetime(df["trading_date"]).dt.date
+                    df = df.with_columns(pl.col("trading_date").cast(pl.Date))
 
-                valid_cols = [
-                    "symbol",
-                    "trading_date",
-                    "open_price",
-                    "high_price",
-                    "low_price",
-                    "close_price",
-                    "total_volume",
-                    "exchange",
-                    "source",
-                ]
-                df_write = df[[c for c in valid_cols if c in df.columns]].copy()
+                df_write = self._select_ohlcv_cols(df)
 
-                upsert_method = self._create_upsert_method(["symbol", "trading_date"])
-                df_write.to_sql(
-                    name=Config.BQ_ADJ_TABLE,
-                    con=self.engine,
-                    if_exists="append",
-                    index=False,
-                    method=upsert_method,
-                    chunksize=5000,
+                # Thực thi Bulk Upsert
+                self._upsert_polars_to_pg(
+                    df=df_write,
+                    table_name=Config.BQ_ADJ_TABLE,
+                    index_elements=["symbol", "trading_date"],
                 )
             self.logger.info(
                 f"🎉 [Postgres] Đồng bộ lịch sử điều chỉnh hoàn tất cho "
@@ -626,7 +690,9 @@ class LocalStorage(BaseStorage):
             try:
                 with self.engine.begin() as conn:
                     # 1. Xóa dữ liệu cũ ngày hôm đó
-                    delete_query: str = "DELETE FROM adj_price WHERE trading_date IN (:dates)"
+                    delete_query: str = (
+                        "DELETE FROM adj_price WHERE trading_date IN (:dates)"
+                    )
                     params: dict[str, Any] = {"dates": chunk_dates}
 
                     if excluded_symbols:
@@ -695,14 +761,19 @@ class LocalStorage(BaseStorage):
             f"cho {len(date_strings)} ngày."
         )
 
-    def get_state(self, key: str) -> Any:
+    def get_state(self, key: str) -> str | dict | list | int | float | bool | None:
         """Đọc một trạng thái tùy ý từ bảng pipeline_state.
+
+        Giá trị lưu trong cột JSON có thể là bất kỳ kiểu JSON nào (string, dict, list,
+        số, bool, None). Caller cần tự ép kiểu nếu cần xử lý nghiệp vụ cụ thể.
+        Ví dụ: nếu lưu bằng save_state(key, "2024-01-15") thì trả về str.
 
         Args:
             key (str): Khóa của trạng thái cần đọc.
 
         Returns:
-            Any: Giá trị của trạng thái (JSON), hoặc None nếu không tồn tại.
+            str | dict | list | int | float | bool | None:
+                Giá trị JSON đã lưu trước đó, hoặc None nếu không tồn tại.
         """
         try:
             with self.Session() as session:
@@ -712,22 +783,32 @@ class LocalStorage(BaseStorage):
             self.logger.warning(f"⚠️ [Postgres] Không thể đọc trạng thái '{key}': {e}")
             return None
 
-    def save_state(self, key: str, value: Any) -> None:
+    def save_state(
+        self, key: str, value: str | dict | list | int | float | bool
+    ) -> None:
         """Lưu một trạng thái tùy ý vào bảng pipeline_state.
+
+        Giá trị phải tương thích JSON (str, dict, list, int, float, bool).
+        Không truyền đối tượng Python tùy ý (datetime, Polars DataFrame,...)
+        vì sẽ gây lỗi serialization tại tầng SQLAlchemy JSON.
 
         Args:
             key (str): Khóa của trạng thái cần lưu.
-            value (Any): Giá trị của trạng thái (cần tương thích JSON).
+            value (str | dict | list | int | float | bool): Giá trị JSON cần lưu.
         """
         try:
             with self.Session() as session:
-                row = session.query(PipelineStateModel).filter_by(key=key).first()
-                if not row:
-                    row = PipelineStateModel(key=key, value=value)
-                    session.add(row)
-                else:
-                    row.value = value
-                session.commit()
+                try:
+                    row = session.query(PipelineStateModel).filter_by(key=key).first()
+                    if not row:
+                        row = PipelineStateModel(key=key, value=value)
+                        session.add(row)
+                    else:
+                        row.value = value
+                    session.commit()
+                except Exception as db_err:
+                    session.rollback()
+                    raise db_err
         except Exception as e:
             self.logger.error(f"❌ [Postgres] Không thể lưu trạng thái '{key}': {e}")
             raise e
@@ -763,159 +844,85 @@ class LocalStorage(BaseStorage):
 
     def save_checkpoint(
         self,
-        df: pd.DataFrame,
+        df: pl.DataFrame,
         active_symbols: set[str] | None = None,
         pending_adjusted_reloads: list[str] | None = None,
     ) -> None:
         """Trích xuất và cập nhật checkpoint trạng thái thị trường EOD vào PostgreSQL.
 
         Args:
-            df (pd.DataFrame): DataFrame chứa thông tin giao dịch trong phiên.
+            df (pl.DataFrame): DataFrame chứa thông tin giao dịch trong phiên.
             active_symbols (set[str] | None, optional): Tập hợp các mã cổ phiếu đang hoạt động.
                 Mặc định là None.
             pending_adjusted_reloads (list[str] | None, optional): Danh sách các mã cổ phiếu
                 đang chờ tải lại lịch sử điều chỉnh giá. Mặc định là None.
 
         Raises:
-            Exception: Phát sinh khi không thể ghi đè/chèn dữ liệu vào bảng pipeline_state.
+            Exception: Phát sinh khi không thể ghi đè/chén dữ liệu vào bảng pipeline_state.
         """
-        if df is None or df.empty:
+        if df is None or df.is_empty():
             return
 
         self.logger.info(
-            "⚡ [Snapshot] Đang trích xuất trạng thái thị trường EOD "
-            "cho PostgreSQL..."
+            "⚡ [Snapshot] Đang trích xuất trạng thái thị trường EOD cho PostgreSQL..."
         )
 
-        df_latest: pd.DataFrame = df.drop_duplicates(
-            subset=["symbol"], keep="last"
-        ).copy()
-
-        price_cols: list[str] = ["open_price", "high_price", "low_price", "close_price"]
-        if "average_price" not in df_latest.columns:
-            df_latest["average_price"] = df_latest[price_cols].mean(axis=1)
-
-        for col in price_cols:
-            df_latest[col] = df_latest[col].astype(float).round(0).astype(int)
-        df_latest["average_price"] = df_latest["average_price"].astype(float).round(1)
-
-        df_latest["trading_date"] = df_latest["trading_date"].dt.strftime("%Y-%m-%d")
-
-        max_date_str: str = str(df_latest["trading_date"].max())
-
-        vn_now: datetime = datetime.now(Config.VN_TZ)
-        today_str: str = vn_now.strftime("%Y-%m-%d")
-        is_eod: bool
-        if max_date_str < today_str:
-            is_eod = True
-        else:
-            is_eod = vn_now.hour > 15 or (vn_now.hour == 15 and vn_now.minute >= 15)
-
-        if isinstance(df_latest["symbol"].dtype, pd.CategoricalDtype):
-            df_latest["symbol"] = df_latest["symbol"].astype(str)
-        df_latest.set_index("symbol", inplace=True)
-
-        cols_to_extract: list[str] = [
-            "exchange",
-            "trading_date",
-            "open_price",
-            "high_price",
-            "low_price",
-            "close_price",
-            "average_price",
-            "total_volume",
-        ]
-        current_data_dict: dict[str, dict[str, Any]] = df_latest[
-            cols_to_extract
-        ].to_dict(orient="index")
-
+        # Xây dựng cấu trúc JSON snapshot qua phương thức dùng chung trên BaseStorage
         old_checkpoint: dict[str, Any] = self.read_checkpoint()
-        merged_snapshots: dict[str, dict[str, Any]] = old_checkpoint.get(
-            "snapshots", {}
+        final_json_structure: dict[str, Any] = self._build_eod_snapshot(
+            df=df,
+            active_symbols=active_symbols,
+            pending_adjusted_reloads=pending_adjusted_reloads,
+            old_checkpoint=old_checkpoint,
         )
-        old_metadata: dict[str, Any] = old_checkpoint.get("metadata") or {}
-        old_pending: list[str] = old_metadata.get("pending_adjusted_reloads") or []
-
-        if pending_adjusted_reloads is None:
-            pending_adjusted_reloads = old_pending
-
-        if is_eod:
-            for sym, new_row in current_data_dict.items():
-                if not sym:
-                    continue
-                old_row: dict[str, Any] | None = merged_snapshots.get(sym)
-                if not old_row or new_row["trading_date"] >= old_row["trading_date"]:
-                    merged_snapshots[sym] = new_row
-        else:
-            self.logger.info(
-                "ℹ️ [Snapshot] Đang chạy trong phiên (Chưa chốt EOD). "
-                "Giữ nguyên dữ liệu snapshots cũ."
-            )
-
-        for sym, row in merged_snapshots.items():
-            for col in price_cols:
-                if col in row and isinstance(row[col], (int, float)):
-                    row[col] = int(round(float(row[col])))
-            if "average_price" in row and isinstance(
-                row["average_price"], (int, float)
-            ):
-                row["average_price"] = round(float(row["average_price"]), 1)
-
-        final_snapshots: dict[str, dict[str, Any]] = {}
-        for sym in sorted(merged_snapshots.keys()):
-            if active_symbols and sym not in active_symbols:
-                continue
-            final_snapshots[sym] = merged_snapshots[sym]
-
-        final_json_structure: dict[str, Any] = {
-            "metadata": {
-                "last_successful_run": max_date_str,
-                "is_eod": is_eod,
-                "total_tickers": len(final_snapshots),
-                "pending_adjusted_reloads": pending_adjusted_reloads,
-            },
-            "snapshots": final_snapshots,
-        }
+        final_snapshots: dict[str, Any] = final_json_structure["snapshots"]
 
         # Lưu vào PostgreSQL
         try:
             with self.Session() as session:
-                # Cập nhật hoặc tạo mới key metadata
-                meta_row = (
-                    session.query(PipelineStateModel).filter_by(key="metadata").first()
-                )
-                if not meta_row:
-                    meta_row = PipelineStateModel(
-                        key="metadata", value=final_json_structure["metadata"]
+                try:
+                    # Cập nhật hoặc tạo mới key metadata
+                    meta_row = (
+                        session.query(PipelineStateModel)
+                        .filter_by(key="metadata")
+                        .first()
                     )
-                    session.add(meta_row)
-                else:
-                    meta_row.value = final_json_structure["metadata"]
+                    if not meta_row:
+                        meta_row = PipelineStateModel(
+                            key="metadata", value=final_json_structure["metadata"]
+                        )
+                        session.add(meta_row)
+                    else:
+                        meta_row.value = final_json_structure["metadata"]
 
-                # Cập nhật hoặc tạo mới key snapshots
-                snap_row = (
-                    session.query(PipelineStateModel).filter_by(key="snapshots").first()
-                )
-                if not snap_row:
-                    snap_row = PipelineStateModel(
-                        key="snapshots", value=final_json_structure["snapshots"]
+                    # Cập nhật hoặc tạo mới key snapshots
+                    snap_row = (
+                        session.query(PipelineStateModel)
+                        .filter_by(key="snapshots")
+                        .first()
                     )
-                    session.add(snap_row)
-                else:
-                    snap_row.value = final_json_structure["snapshots"]
+                    if not snap_row:
+                        snap_row = PipelineStateModel(
+                            key="snapshots", value=final_json_structure["snapshots"]
+                        )
+                        session.add(snap_row)
+                    else:
+                        snap_row.value = final_json_structure["snapshots"]
 
-                session.commit()
-                self.logger.info(
-                    f"💾 [Postgres Checkpoint] Lưu checkpoint thành công cho "
-                    f"{len(final_snapshots)} mã."
-                )
+                    session.commit()
+                    self.logger.info(
+                        f"💾 [Postgres Checkpoint] Lưu checkpoint thành công cho "
+                        f"{len(final_snapshots)} mã."
+                    )
+                except Exception as db_err:
+                    session.rollback()
+                    raise db_err
         except Exception as e:
             self.logger.error(
                 f"🛑 [Postgres Checkpoint] Ghi tệp snapshot trạng thái vào "
                 f"database thất bại: {e}"
             )
         finally:
-            del current_data_dict, merged_snapshots, final_snapshots
             gc.collect()
 
     def read_blacklist(self) -> set[str]:
@@ -959,26 +966,18 @@ class LocalStorage(BaseStorage):
             f"💾 [Postgres] Đang lưu {len(events)} sự kiện doanh nghiệp..."
         )
         try:
-            df = pd.DataFrame(events)
+            df = pl.DataFrame(events)
 
             # Ép kiểu ex_date và record_date về date
             if "ex_date" in df.columns:
-                df["ex_date"] = pd.to_datetime(df["ex_date"]).dt.date
+                df = df.with_columns(pl.col("ex_date").cast(pl.Date))
             if "record_date" in df.columns:
-                df["record_date"] = pd.to_datetime(df["record_date"]).apply(
-                    lambda x: x.date() if pd.notna(x) else None
-                )
+                df = df.with_columns(pl.col("record_date").cast(pl.Date))
 
-            upsert_method = self._create_upsert_method(
-                ["symbol", "event_type", "ex_date"]
-            )
-            df.to_sql(
-                name="corporate_events",
-                con=self.engine,
-                if_exists="append",
-                index=False,
-                method=upsert_method,
-                chunksize=5000,
+            self._upsert_polars_to_pg(
+                df=df,
+                table_name="corporate_events",
+                index_elements=["symbol", "event_type", "ex_date"],
             )
             self.logger.info("🎉 [Postgres] Lưu sự kiện doanh nghiệp thành công.")
         except Exception as e:
@@ -987,58 +986,48 @@ class LocalStorage(BaseStorage):
             )
             raise e
 
-    def save_icb_industries(self, df_icb: pd.DataFrame) -> None:
+    def save_icb_industries(self, df_icb: pl.DataFrame) -> None:
         """Lưu danh mục ngành ICB vào PostgreSQL.
 
         Args:
-            df_icb (pd.DataFrame): DataFrame chứa thông tin danh mục phân loại ngành ICB.
+            df_icb (pl.DataFrame): DataFrame chứa thông tin danh mục phân loại ngành ICB.
 
         Raises:
             Exception: Lỗi phát sinh khi thực hiện chèn/cập nhật thông tin vào cơ sở dữ liệu.
         """
-        if df_icb is None or df_icb.empty:
+        if df_icb is None or df_icb.is_empty():
             return
-        self.logger.info(
-            f"💾 [Postgres] Đang lưu {len(df_icb)} ngành ICB..."
-        )
+        self.logger.info(f"💾 [Postgres] Đang lưu {len(df_icb)} ngành ICB...")
         try:
-            upsert_method = self._create_upsert_method(["icb_code"])
-            df_icb.to_sql(
-                name="icb_industries",
-                con=self.engine,
-                if_exists="append",
-                index=False,
-                method=upsert_method,
-                chunksize=5000,
+            self._upsert_polars_to_pg(
+                df=df_icb,
+                table_name="icb_industries",
+                index_elements=["icb_code"],
             )
             self.logger.info("🎉 [Postgres] Lưu danh mục ngành ICB thành công.")
         except Exception as e:
             self.logger.error(f"❌ [Postgres] Gặp lỗi khi lưu danh mục ngành ICB: {e}")
             raise e
 
-    def save_companies(self, df_companies: pd.DataFrame) -> None:
+    def save_companies(self, df_companies: pl.DataFrame) -> None:
         """Lưu danh sách công ty vào PostgreSQL.
 
         Args:
-            df_companies (pd.DataFrame): DataFrame chứa thông tin danh sách các công ty.
+            df_companies (pl.DataFrame): DataFrame chứa thông tin danh sách các công ty.
 
         Raises:
             Exception: Lỗi phát sinh khi thực hiện chèn/cập nhật thông tin vào cơ sở dữ liệu.
         """
-        if df_companies is None or df_companies.empty:
+        if df_companies is None or df_companies.is_empty():
             return
         self.logger.info(
             f"💾 [Postgres] Đang lưu {len(df_companies)} thông tin công ty..."
         )
         try:
-            upsert_method = self._create_upsert_method(["symbol"])
-            df_companies.to_sql(
-                name="companies",
-                con=self.engine,
-                if_exists="append",
-                index=False,
-                method=upsert_method,
-                chunksize=5000,
+            self._upsert_polars_to_pg(
+                df=df_companies,
+                table_name="companies",
+                index_elements=["symbol"],
             )
             self.logger.info("🎉 [Postgres] Lưu thông tin công ty thành công.")
         except Exception as e:
@@ -1073,52 +1062,29 @@ class LocalStorage(BaseStorage):
                 )
                 return
 
-            df: pd.DataFrame = pd.read_parquet(local_path)
-            if df.empty:
+            df: pl.DataFrame = pl.read_parquet(local_path)
+            if df.is_empty():
                 return
 
             if "trading_date" in df.columns:
-                df["trading_date"] = pd.to_datetime(df["trading_date"]).dt.date
+                df = df.with_columns(pl.col("trading_date").cast(pl.Date))
 
-            valid_cols: list[str] = [
-                "symbol",
-                "trading_date",
-                "open_price",
-                "high_price",
-                "low_price",
-                "close_price",
-                "total_volume",
-                "exchange",
-                "source",
-            ]
-            df_write: pd.DataFrame = df[
-                [c for c in valid_cols if c in df.columns]
-            ].copy()
+            df_write = self._select_ohlcv_cols(df)
 
+            # Xử lý TRUNCATE nếu được yêu cầu
             if write_disposition == "WRITE_TRUNCATE":
+                # Kiểm tra tên bảng trước khi nhúng vào SQL để ngăn chặn SQL Injection
+                self._validate_table_name(table_name)
                 self.logger.info(f"🗑️ [Postgres] Truncate bảng {table_name}...")
                 with self.engine.begin() as conn:
                     conn.execute(text(f"TRUNCATE TABLE {table_name} CASCADE;"))
 
-            # Nạp vào PostgreSQL với chunksize đề phòng lỗi tràn tham số
-            if write_disposition == "WRITE_TRUNCATE":
-                df_write.to_sql(
-                    name=table_name,
-                    con=self.engine,
-                    if_exists="append",
-                    index=False,
-                    chunksize=5000,
-                )
-            else:
-                upsert_method = self._create_upsert_method(["symbol", "trading_date"])
-                df_write.to_sql(
-                    name=table_name,
-                    con=self.engine,
-                    if_exists="append",
-                    index=False,
-                    method=upsert_method,
-                    chunksize=5000,
-                )
+            # Dùng luôn hàm upsert cho cả 2 trường hợp
+            self._upsert_polars_to_pg(
+                df=df_write,
+                table_name=table_name,
+                index_elements=["symbol", "trading_date"],
+            )
             self.logger.info(
                 f"🎉 [Postgres] Nạp hoàn tất dữ liệu từ file Parquet vào bảng {table_name}."
             )

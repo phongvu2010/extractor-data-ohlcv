@@ -1,6 +1,7 @@
 from datetime import date, datetime
+import logging
 import os
-import warnings
+import re
 
 from dotenv import load_dotenv
 import holidays
@@ -15,7 +16,8 @@ def _get_env_int(key: str, default: int) -> int:
 
     Args:
         key (str): Tên biến môi trường cần lấy.
-        default (int): Giá trị mặc định nếu biến môi trường không tồn tại hoặc lỗi định dạng.
+        default (int): Giá trị mặc định nếu biến môi trường
+            không tồn tại hoặc lỗi định dạng.
 
     Returns:
         int: Giá trị số nguyên tương ứng.
@@ -33,10 +35,10 @@ def _get_env_int(key: str, default: int) -> int:
     try:
         return int(val)
     except ValueError:
-        warnings.warn(
-            f"Environment variable '{key}' has value {val!r} which cannot be parsed to an int. "
-            f"Using default value: {default}",
-            UserWarning,
+        logger = logging.getLogger(os.getenv("DEFAULT_LOGGER_NAME", "ETL_Pipeline"))
+        logger.warning(
+            f"⚠️ Environment variable '{key}' has value {val!r} which cannot be parsed to an int. "
+            f"Using default value: {default}"
         )
         return default
 
@@ -46,7 +48,8 @@ def _get_env_float(key: str, default: float) -> float:
 
     Args:
         key (str): Tên biến môi trường cần lấy.
-        default (float): Giá trị mặc định nếu biến môi trường không tồn tại hoặc lỗi định dạng.
+        default (float): Giá trị mặc định nếu biến môi trường
+            không tồn tại hoặc lỗi định dạng.
 
     Returns:
         float: Giá trị số thực tương ứng.
@@ -64,16 +67,16 @@ def _get_env_float(key: str, default: float) -> float:
     try:
         return float(val)
     except ValueError:
-        warnings.warn(
-            f"Environment variable '{key}' has value {val!r} which cannot be parsed to a float. "
-            f"Using default value: {default}",
-            UserWarning,
+        logger = logging.getLogger(os.getenv("DEFAULT_LOGGER_NAME", "ETL_Pipeline"))
+        logger.warning(
+            f"⚠️ Environment variable '{key}' has value {val!r} which cannot be parsed to a float. "
+            f"Using default value: {default}"
         )
         return float(default)
 
 
 def _get_secret(key: str, default: str = "") -> str:
-    """Lấy giá trị cấu hình bảo mật từ tệp mount của Secret Manager hoặc biến môi trường.
+    """Lấy cấu hình bảo mật từ Secret Manager hoặc biến môi trường.
 
     Args:
         key (str): Tên secret cần lấy.
@@ -106,11 +109,11 @@ class Config:
     def get_vn_holiday_dates(cls) -> list[str]:
         """Lấy danh sách các ngày nghỉ lễ của Việt Nam.
 
-        Kết hợp ngày lễ quốc gia và cấu hình thủ công qua CUSTOM_HOLIDAYS,
-        sử dụng cơ chế cache tránh tính toán lặp lại.
+        Kết hợp ngày lễ quốc gia và cấu hình thủ công qua
+        CUSTOM_HOLIDAYS, sử dụng cơ chế cache tránh tính toán lặp lại.
 
         Returns:
-            list[str]: Danh sách các ngày nghỉ lễ được định dạng chuỗi YYYY-MM-DD.
+            list[str]: Danh sách ngày nghỉ lễ định dạng YYYY-MM-DD.
         """
         current_year: int = datetime.now(cls.VN_TZ).year
         if cls._cached_year != current_year or cls._cached_holidays is None:
@@ -119,7 +122,8 @@ class Config:
                 "VN", years=[current_year - 1, current_year, current_year + 1]
             )
 
-            # Danh sách ngày nghỉ lễ bổ sung được cấu hình thủ công qua biến môi trường (dạng YYYY-MM-DD, cách nhau bởi dấu phẩy)
+            # Danh sách ngày nghỉ lễ bổ sung được cấu hình thủ công qua
+            # biến môi trường (dạng YYYY-MM-DD, cách nhau bởi dấu phẩy)
             custom_holidays_raw: str = os.getenv("CUSTOM_HOLIDAYS", "")
             custom_holiday_list: list[str] = []
             for d in custom_holidays_raw.split(","):
@@ -134,10 +138,10 @@ class Config:
                     ).date()
                     custom_holiday_list.append(valid_date.strftime("%Y-%m-%d"))
                 except ValueError:
-                    warnings.warn(
+                    logger = logging.getLogger(cls.DEFAULT_LOGGER_NAME)
+                    logger.warning(
                         f"Environment variable 'CUSTOM_HOLIDAYS' contains invalid entry {d_clean!r}. "
-                        "Expected format: YYYY-MM-DD. Ignoring this entry.",
-                        UserWarning,
+                        "Expected format: YYYY-MM-DD. Ignoring this entry."
                     )
 
             cls._cached_holidays = sorted(
@@ -160,12 +164,10 @@ class Config:
         "GCS_CHECKPOINT_KEY", "checkpoints/latest_state.json"
     )
     GCS_PARQUET_PREFIX: str = os.getenv("GCS_PARQUET_PREFIX", "market_data")
-    GCS_EXPORT_TICKERS_KEY: str = os.getenv(
-        "GCS_EXPORT_TICKERS_KEY", "config/interested_tickers.txt"
-    )
-    GCS_BLACKLIST_KEY: str = os.getenv("GCS_BLACKLIST_KEY", "config/blacklist.txt")
+    GCS_EXPORT_TICKERS_KEY: str = os.getenv("GCS_EXPORT_TICKERS_KEY", "")
+    GCS_BLACKLIST_KEY: str = os.getenv("GCS_BLACKLIST_KEY", "configs/blacklist.txt")
     GCS_EXPORT_PREFIX: str = os.getenv("GCS_EXPORT_PREFIX", "exports")
-    GCS_EXPORT_YEARS: int = _get_env_int("GCS_EXPORT_YEARS", 3)
+    GCS_EXPORT_YEARS: int = _get_env_int("GCS_EXPORT_YEARS", 10)
 
     # Cấu hình Google Cloud BigQuery (BQ)
     BQ_DATASET: str = os.getenv("BQ_DATASET", "vn_stock_dataset")
@@ -194,17 +196,44 @@ class Config:
     TELEGRAM_CHAT_ID: str = _get_secret("TELEGRAM_CHAT_ID", "")
 
     # Cấu hình bỏ qua các chốt chặn ngày nghỉ (cuối tuần / lễ) khi cần chạy ép buộc
-    FORCE_RUN: bool = (
-        os.getenv("FORCE_RUN", os.getenv("FORCE_RUN_WEEKEND", "false")).lower()
-        == "true"
-    )
+    FORCE_RUN: bool = os.getenv("FORCE_RUN", "false").lower() == "true"
+
+    # Cấu hình ngày bắt đầu tải lịch sử mặc định khi reload giá điều chỉnh
+    HISTORICAL_START_DATE: str = os.getenv(
+        "HISTORICAL_START_DATE", "2000-01-01"
+    ).strip()
+
+    # Cấu hình giờ chốt phiên EOD (giờ và phút)
+    EOD_HOUR: int = _get_env_int("EOD_HOUR", 16)
+    EOD_MINUTE: int = _get_env_int("EOD_MINUTE", 30)
+
+    # Danh sách mã cổ phiếu benchmark kiểm định đơn vị giá
+    BENCHMARK_TICKERS: list[str] = [
+        t.strip().upper()
+        for t in os.getenv("BENCHMARK_TICKERS", "FPT,HPG,VNM,VIC").split(",")
+        if t.strip()
+    ]
+
+    # Cấu hình chu kỳ đồng bộ thông tin công ty và ngành ICB (ngày)
+    COMPANY_SYNC_INTERVAL_DAYS: int = _get_env_int("COMPANY_SYNC_INTERVAL_DAYS", 7)
+
+    # Cấu hình kích thước lô (batch size) khi tải bảng giá T0 và reload giá điều chỉnh
+    PRICE_BOARD_BATCH_SIZE: int = _get_env_int("PRICE_BOARD_BATCH_SIZE", 500)
+    RELOAD_BATCH_SIZE: int = _get_env_int("RELOAD_BATCH_SIZE", 10)
+
+    # Ngưỡng phát hiện lỗi nghiêm trọng liên tiếp khi tải ohlcv
+    CRITICAL_FAILURE_THRESHOLD: int = _get_env_int("CRITICAL_FAILURE_THRESHOLD", 5)
+
+    # Kích thước lô ghi dữ liệu (Bulk Upsert) vào cơ sở dữ liệu
+    DB_UPSERT_CHUNK_SIZE: int = _get_env_int("DB_UPSERT_CHUNK_SIZE", 5000)
 
     @classmethod
     def validate_config(cls) -> None:
         """Kiểm tra cấu hình hệ thống và đưa ra các cảnh báo cần thiết.
 
-        Raises:
-            RuntimeWarning: Nếu thiếu các biến môi trường quan trọng.
+        Kiểm tra xem các biến môi trường quan trọng như DATABASE_URL (cho local)
+        hoặc GCS_BUCKET_NAME, BQ_DATASET (cho cloud) có đầy đủ không, đồng thời
+        kiểm định thông tin Telegram cấu hình và tính hợp lệ của các mã benchmark.
         """
         missing_critical: list[str] = []
         if cls.DEPLOYMENT_ENV == "local":
@@ -216,23 +245,38 @@ class Config:
             if not cls.BQ_DATASET:
                 missing_critical.append("BQ_DATASET")
 
+        logger = logging.getLogger(cls.DEFAULT_LOGGER_NAME)
         if missing_critical:
-            warnings.warn(
-                f"⚠️ [Cấu hình] Thiếu các biến môi trường quan trọng cho chế độ '{cls.DEPLOYMENT_ENV}': {', '.join(missing_critical)}. "
-                "Hệ thống có thể không hoạt động hoặc sập khi thực thi.",
-                RuntimeWarning,
+            logger.warning(
+                f"⚠️ [Cấu hình] Thiếu các biến môi trường quan trọng cho "
+                f"chế độ '{cls.DEPLOYMENT_ENV}': "
+                f"{', '.join(missing_critical)}. Hệ thống có thể không "
+                f"hoạt động hoặc sập khi thực thi."
             )
 
         # Cảnh báo nếu cấu hình Telegram bị thiếu 1 trong 2 trường
         if (cls.TELEGRAM_BOT_TOKEN and not cls.TELEGRAM_CHAT_ID) or (
             cls.TELEGRAM_CHAT_ID and not cls.TELEGRAM_BOT_TOKEN
         ):
-            warnings.warn(
-                "⚠️ [Cấu hình] Thiếu TELEGRAM_BOT_TOKEN hoặc TELEGRAM_CHAT_ID. "
-                "Hệ thống sẽ không gửi được thông báo cảnh báo qua Telegram.",
-                UserWarning,
+            logger.warning(
+                "⚠️ [Cấu hình] Thiếu TELEGRAM_BOT_TOKEN hoặc "
+                "TELEGRAM_CHAT_ID. Hệ thống sẽ không gửi được thông báo "
+                "cảnh báo qua Telegram."
             )
 
-
-# Tự động kiểm tra cấu hình khi import module config
-Config.validate_config()
+        # Kiểm định định dạng các mã benchmark
+        valid_benchmarks: list[str] = []
+        for ticker in cls.BENCHMARK_TICKERS:
+            if re.match(r"^[A-Z0-9]{3,10}$", ticker):
+                valid_benchmarks.append(ticker)
+            else:
+                logger.warning(
+                    f"⚠️ [Cấu hình] Mã benchmark '{ticker}' không đúng định dạng. Bỏ qua mã này."
+                )
+        if not valid_benchmarks:
+            logger.warning(
+                "⚠️ [Cấu hình] Không có mã benchmark nào hợp lệ. Sử dụng danh sách mặc định ['FPT', 'HPG', 'VNM', 'VIC']."
+            )
+            cls.BENCHMARK_TICKERS = ["FPT", "HPG", "VNM", "VIC"]
+        else:
+            cls.BENCHMARK_TICKERS = valid_benchmarks
