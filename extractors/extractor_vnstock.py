@@ -1237,16 +1237,6 @@ class VnstockExtractorETL:
             "✅ [Vnstock] Đã lưu checkpoint trạng thái thị trường EOD thành công."
         )
 
-        # 8.5. Trích xuất dữ liệu của các mã cổ phiếu quan tâm lên GCS
-        export_summary: dict[str, Any] | None = None
-        try:
-            export_summary = self.storage.export_interested_tickers_data()
-        except Exception as export_err:
-            self.logger.error(
-                f"❌ [Vnstock] Lỗi khi trích xuất các mã cổ phiếu quan tâm: {export_err}",
-                exc_info=True,
-            )
-
         # 9. Gửi báo cáo thông báo trạng thái kết thúc phiên chạy qua Telegram
         try:
             vn_now: datetime = datetime.now(Config.VN_TZ)
@@ -1271,7 +1261,6 @@ class VnstockExtractorETL:
                 missing_dates=missing_dates,
                 reloaded_symbols=reloaded_symbols,
                 failed_reloads=failed_reloads,
-                export_summary=export_summary,
             )
         except Exception as notify_err:
             self.logger.error(

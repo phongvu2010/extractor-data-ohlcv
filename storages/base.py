@@ -193,14 +193,6 @@ class BaseStorage(ABC):
         """
         pass
 
-    def export_interested_tickers_data(self) -> dict[str, Any] | None:
-        """Trích xuất dữ liệu các mã cổ phiếu quan tâm. (Chỉ áp dụng cho CloudStorage)
-
-        Returns:
-            dict[str, Any] | None: Dict chứa tóm tắt kết quả xuất dữ liệu, hoặc None.
-        """
-        return None
-
     def _build_eod_snapshot(
         self,
         df: pl.DataFrame,

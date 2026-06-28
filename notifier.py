@@ -141,7 +141,6 @@ class Notifier:
         missing_dates: list[Any],
         reloaded_symbols: list[str],
         failed_reloads: list[str],
-        export_summary: dict[str, Any] | None = None,
     ) -> None:
         """Gửi báo cáo tổng hợp chi tiết sau phiên chạy thành công.
 
@@ -152,7 +151,6 @@ class Notifier:
             missing_dates (list[Any]): Các ngày giao dịch còn thiếu.
             reloaded_symbols (list[str]): Các mã đã tải lại thành công.
             failed_reloads (list[str]): Các mã lỗi reload.
-            export_summary (dict[str, Any] | None): Tóm tắt xuất GCS.
         """
 
         def _format_symbols(symbols: list[str], max_show: int = 15) -> str:
@@ -186,14 +184,6 @@ class Notifier:
             formatted_msg += f"❌ <b>Mã lỗi reload:</b> <code>{failed_str}</code>\n"
         else:
             formatted_msg += "✨ <b>Kết quả:</b> Hoàn thành xuất sắc, không có lỗi.\n"
-
-        if export_summary:
-            formatted_msg += (
-                f"\n📤 <b>Trích xuất GCS (Parquet):</b>\n"
-                f"📋 <b>Mã quan tâm:</b> {export_summary['tickers_count']} mã ({export_summary['exported_count']} thành công)\n"
-                f"📄 <b>Dòng Giá Thô:</b> {export_summary['raw_rows']:,} dòng\n"
-                f"📄 <b>Dòng Giá Điều chỉnh:</b> {export_summary['adj_rows']:,} dòng\n"
-            )
 
         formatted_msg += f"\n⏰ <i>Thời gian chạy: {datetime.now(Config.VN_TZ).strftime('%Y-%m-%d %H:%M:%S')}</i>"
 

@@ -164,10 +164,7 @@ class Config:
         "GCS_CHECKPOINT_KEY", "checkpoints/latest_state.json"
     )
     GCS_PARQUET_PREFIX: str = os.getenv("GCS_PARQUET_PREFIX", "market_data")
-    GCS_EXPORT_TICKERS_KEY: str = os.getenv("GCS_EXPORT_TICKERS_KEY", "")
     GCS_BLACKLIST_KEY: str = os.getenv("GCS_BLACKLIST_KEY", "configs/blacklist.txt")
-    GCS_EXPORT_PREFIX: str = os.getenv("GCS_EXPORT_PREFIX", "exports")
-    GCS_EXPORT_YEARS: int = _get_env_int("GCS_EXPORT_YEARS", 10)
 
     # Cấu hình Google Cloud BigQuery (BQ)
     BQ_DATASET: str = os.getenv("BQ_DATASET", "vn_stock_dataset")
