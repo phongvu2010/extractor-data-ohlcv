@@ -12,7 +12,7 @@ from typing import Any
 import pandera.errors as pa_errors
 import polars as pl
 import requests
-from vnstock import Trading
+from vnstock import Reference, Trading
 from vnstock.core.utils.user_agent import get_headers
 from vnstock.ui import Market
 
@@ -34,6 +34,7 @@ class DataProcessor:
 
     logger: logging.Logger
     source: str
+    reference_api: Reference
     trading_api: Trading
     market_api: Market
     rate_limiter: SmartRateLimiter
@@ -48,6 +49,7 @@ class DataProcessor:
         self.logger = logger
         self.source = source or Config.VNSTOCK_DEFAULT_SOURCE
 
+        self.reference_api = Reference()
         self.trading_api = Trading()
         self.market_api = Market()
 
@@ -145,7 +147,7 @@ class DataProcessor:
 
             dfs.append(df_quote)
 
-        df_all: pl.DataFrame = pl.concat(dfs)
+        df_all: pl.DataFrame = pl.concat(dfs, how="vertical_relaxed")
 
         # Chuẩn hóa tên sàn giao dịch bằng biểu thức dùng chung
         df_all = df_all.with_columns(get_exchange_normalization_expr("exchange"))
@@ -353,7 +355,7 @@ class DataProcessor:
         if not all_dfs:
             return []
 
-        df_events: pl.DataFrame = pl.concat(all_dfs, how="diagonal")
+        df_events: pl.DataFrame = pl.concat(all_dfs, how="diagonal_relaxed")
         rename_map: dict[str, str] = {}
         if "exrightDate" in df_events.columns:
             rename_map["exrightDate"] = "exright_date"
@@ -565,7 +567,6 @@ class VnstockExtractorETL:
         events = self.processor.detect_corporate_actions_via_api(
             symbols, today_date, today_date
         )
-        self.storage.save_corporate_events(events)
         return {e["symbol"]: e["ex_date"] for e in events}
 
     def _backfill_missing_history(self, missing_dates: list[date]) -> None:
@@ -1046,6 +1047,19 @@ class VnstockExtractorETL:
                         f"⚡ [Events] Đồng bộ gộp lên database cho các mã thành công của lô: {successful_batch}"
                     )
                     self.storage.sync_adjusted_symbols_to_bigquery(successful_batch)
+
+            # Bổ sung tất cả các mã chưa kịp chạy vào danh sách failed_reloads để checkpoint lưu lại cho phiên sau
+            unprocessed_tickers: list[str] = [
+                t
+                for t in tickers_list
+                if t not in successful_reloads and t not in failed_reloads
+            ]
+            if unprocessed_tickers:
+                self.logger.warning(
+                    f"⚠️ [Events] Phát hiện {len(unprocessed_tickers)} mã chưa kịp xử lý do dừng tiến trình. "
+                    f"Tự động chuyển vào danh sách chờ reload lần sau: {unprocessed_tickers}"
+                )
+                failed_reloads.extend(unprocessed_tickers)
         else:
             self.logger.info(
                 "ℹ️ [Events] Không phát hiện mã cổ phiếu nào cần tải lại lịch sử giá điều chỉnh."

@@ -128,7 +128,6 @@ class BaseStorage(ABC):
         """
         pass
 
-
     @abstractmethod
     def get_state(self, key: str) -> Any:
         """Đọc một trạng thái tùy ý từ kho lưu trữ.
@@ -150,7 +149,6 @@ class BaseStorage(ABC):
             value (Any): Giá trị của trạng thái (cần tương thích JSON).
         """
         pass
-
 
     @abstractmethod
     def load_parquet_to_bigquery(

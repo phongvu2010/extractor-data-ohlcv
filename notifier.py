@@ -35,7 +35,7 @@ class Notifier:
             total=3,
             backoff_factor=2,  # Khoảng giãn cách giữa các lần thử lại là 2s, 4s, 8s
             status_forcelist=[500, 502, 503, 504],
-            raise_on_status=False  # Để ta tự bắt lỗi HTTPError và xử lý logic 4xx
+            raise_on_status=False,  # Để ta tự bắt lỗi HTTPError và xử lý logic 4xx
         )
         self.session.mount("https://", HTTPAdapter(max_retries=retries))
 
@@ -91,10 +91,7 @@ class Notifier:
             self.logger.info("📲 [Telegram] Gửi tin nhắn thành công.")
         except requests.exceptions.RequestException as e:
             # Nếu là lỗi HTTP phía client (ví dụ 400 Bad Request, 401 Unauthorized do token/chat_id sai)
-            if (
-                isinstance(e, requests.exceptions.HTTPError)
-                and e.response is not None
-            ):
+            if isinstance(e, requests.exceptions.HTTPError) and e.response is not None:
                 if 400 <= e.response.status_code < 500:
                     self.logger.error(
                         f"❌ [Telegram] Lỗi client nghiêm trọng (HTTP {e.response.status_code}). Chi tiết: {e.response.text}"

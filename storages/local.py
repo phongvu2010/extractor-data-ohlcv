@@ -38,6 +38,7 @@ from .base import BaseStorage
 class Base(DeclarativeBase):
     """Base class cho tất cả ORM models (SQLAlchemy 2.0 style)."""
 
+
 class RawPriceModel(Base):
     """Bảng lưu trữ giá thô (raw price) của các cổ phiếu (được chuyển thành Hypertable)."""
 
@@ -878,7 +879,7 @@ class LocalStorage(BaseStorage):
                 Trả về tập hợp rỗng nếu không tìm thấy file.
         """
         try:
-            with open(Config.GCS_BLACKLIST_KEY, "r", encoding="utf-8") as file:
+            with open(Config.BLACKLIST_PATH_KEY, "r", encoding="utf-8") as file:
                 blacklist: set[str] = {
                     line.strip().upper()
                     for line in file
@@ -891,7 +892,7 @@ class LocalStorage(BaseStorage):
                 return blacklist
         except FileNotFoundError:
             self.logger.warning(
-                f"⚠️ [LocalStorage] Không tìm thấy file '{Config.GCS_BLACKLIST_KEY}' "
+                f"⚠️ [LocalStorage] Không tìm thấy file '{Config.BLACKLIST_PATH_KEY}' "
                 "cục bộ. Bỏ qua bộ lọc blacklist."
             )
             return set()

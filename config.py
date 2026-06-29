@@ -164,7 +164,7 @@ class Config:
         "GCS_CHECKPOINT_KEY", "checkpoints/latest_state.json"
     )
     GCS_PARQUET_PREFIX: str = os.getenv("GCS_PARQUET_PREFIX", "market_data")
-    GCS_BLACKLIST_KEY: str = os.getenv("GCS_BLACKLIST_KEY", "configs/blacklist.txt")
+    BLACKLIST_PATH_KEY: str = os.getenv("BLACKLIST_PATH_KEY", "configs/blacklist.txt")
 
     # Cấu hình Google Cloud BigQuery (BQ)
     BQ_DATASET: str = os.getenv("BQ_DATASET", "vn_stock_dataset")
@@ -241,12 +241,13 @@ class Config:
 
         logger = logging.getLogger(cls.DEFAULT_LOGGER_NAME)
         if missing_critical:
-            logger.warning(
-                f"⚠️ [Cấu hình] Thiếu các biến môi trường quan trọng cho "
-                f"chế độ '{cls.DEPLOYMENT_ENV}': "
-                f"{', '.join(missing_critical)}. Hệ thống có thể không "
-                f"hoạt động hoặc sập khi thực thi."
+            error_msg: str = (
+                f"🛑 [Cấu hình] Thiếu các biến môi trường quan trọng cho "
+                f"chế độ '{cls.DEPLOYMENT_ENV}': {', '.join(missing_critical)}. "
+                f"Không thể khởi chạy hệ thống."
             )
+            logger.error(error_msg)
+            raise ValueError(error_msg)
 
         # Cảnh báo nếu cấu hình Telegram bị thiếu 1 trong 2 trường
         if (cls.TELEGRAM_BOT_TOKEN and not cls.TELEGRAM_CHAT_ID) or (

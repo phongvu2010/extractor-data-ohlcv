@@ -214,7 +214,7 @@ class DataProcessor:
                 )
 
         try:
-            with open(Config.GCS_BLACKLIST_KEY, "r", encoding="utf-8") as file:
+            with open(Config.BLACKLIST_PATH_KEY, "r", encoding="utf-8") as file:
                 return {
                     line.strip().upper()
                     for line in file
@@ -222,7 +222,7 @@ class DataProcessor:
                 }
         except FileNotFoundError:
             self.logger.warning(
-                f"⚠️ [CafeF] Không tìm thấy file '{Config.GCS_BLACKLIST_KEY}' cục bộ. Bỏ qua bộ lọc danh sách đen."
+                f"⚠️ [CafeF] Không tìm thấy file '{Config.BLACKLIST_PATH_KEY}' cục bộ. Bỏ qua bộ lọc danh sách đen."
             )
             return set()
 
@@ -393,7 +393,9 @@ class DataProcessor:
                     if not lazy_dfs:
                         return pl.DataFrame(schema=schema).select(final_cols_order)
 
-                    self.logger.info("🧱 Đang thực thi Out-of-Core Processing để gộp dữ liệu...")
+                    self.logger.info(
+                        "🧱 Đang thực thi Out-of-Core Processing để gộp dữ liệu..."
+                    )
 
                     # Gọi collect() bên trong block 'with' để các file CSV tạm thời vẫn tồn tại khi Polars đọc dữ liệu
                     result_df = (

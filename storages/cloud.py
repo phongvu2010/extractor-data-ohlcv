@@ -84,8 +84,31 @@ class CloudStorage(BaseStorage):
             self.logger.error(f"❌ [Storage] Lỗi khởi tạo kết nối Cloud Services: {e}")
             raise e
 
+        # Xác thực tên dataset và bảng để ngăn ngừa SQL Injection ngay khi khởi động
+        self._validate_dataset_name(Config.BQ_DATASET)
+        self._validate_table_name(Config.BQ_RAW_TABLE)
+        self._validate_table_name(Config.BQ_ADJ_TABLE)
+
         # Tự động quét và dọn dẹp các bảng staging rác của phiên trước
         self.cleanup_stale_staging_tables()
+
+    def _validate_table_name(self, table_name: str) -> str:
+        """Xác thực tên bảng BigQuery để ngăn ngừa SQL Injection."""
+        if not re.match(r"^[a-zA-Z0-9_]{1,100}$", table_name):
+            raise ValueError(
+                f"Tên bảng '{table_name}' không hợp lệ hoặc chứa kí tự lạ."
+            )
+
+        allowed = {Config.BQ_RAW_TABLE, Config.BQ_ADJ_TABLE}
+        if table_name not in allowed and "_staging_" not in table_name:
+            raise ValueError(f"Tên bảng '{table_name}' không được phép truy cập.")
+        return table_name
+
+    def _validate_dataset_name(self, dataset_name: str) -> str:
+        """Xác thực tên dataset BigQuery để ngăn ngừa SQL Injection."""
+        if not re.match(r"^[a-zA-Z0-9_]{1,100}$", dataset_name):
+            raise ValueError(f"Tên dataset '{dataset_name}' không hợp lệ.")
+        return dataset_name
 
     def cleanup_stale_staging_tables(self) -> None:
         """Tìm và dọn dẹp các bảng staging BigQuery còn sót lại từ các lần chạy trước."""
@@ -321,6 +344,8 @@ class CloudStorage(BaseStorage):
         Args:
             table_name (str): Tên bảng BigQuery cần kiểm tra/khởi tạo.
         """
+        self._validate_dataset_name(Config.BQ_DATASET)
+        self._validate_table_name(table_name)
         dataset_ref: bigquery.DatasetReference = self.bq_client.dataset(
             Config.BQ_DATASET
         )
@@ -384,6 +409,8 @@ class CloudStorage(BaseStorage):
             f"⚡ [BigQuery] Bắt đầu đồng bộ lịch sử điều chỉnh cho mã {symbol_upper}..."
         )
 
+        self._validate_dataset_name(Config.BQ_DATASET)
+        self._validate_table_name(Config.BQ_ADJ_TABLE)
         target_table_ref: str = (
             f"{self.bq_client.project}.{Config.BQ_DATASET}.{Config.BQ_ADJ_TABLE}"
         )
@@ -393,6 +420,7 @@ class CloudStorage(BaseStorage):
         staging_table_name: str = (
             f"{Config.BQ_ADJ_TABLE}_staging_{clean_symbol}_{run_id}"
         )
+        self._validate_table_name(staging_table_name)
         staging_table_ref: str = (
             f"{self.bq_client.project}.{Config.BQ_DATASET}.{staging_table_name}"
         )
@@ -535,11 +563,14 @@ class CloudStorage(BaseStorage):
             f"⚡ [BigQuery] Bắt đầu đồng bộ gộp lịch sử điều chỉnh cho {len(valid_symbols)} mã..."
         )
 
+        self._validate_dataset_name(Config.BQ_DATASET)
+        self._validate_table_name(Config.BQ_ADJ_TABLE)
         target_table_ref: str = (
             f"{self.bq_client.project}.{Config.BQ_DATASET}.{Config.BQ_ADJ_TABLE}"
         )
         run_id: str = uuid.uuid4().hex[:8]
         staging_table_name: str = f"{Config.BQ_ADJ_TABLE}_staging_batch_{run_id}"
+        self._validate_table_name(staging_table_name)
         staging_table_ref: str = (
             f"{self.bq_client.project}.{Config.BQ_DATASET}.{staging_table_name}"
         )
@@ -648,6 +679,7 @@ class CloudStorage(BaseStorage):
         Raises:
             Exception: Phát sinh khi load job thất bại.
         """
+        self._validate_table_name(table_name)
         gcs_uri: str = f"gs://{Config.GCS_BUCKET_NAME}/{gcs_path}"
         table_ref: str = f"{self.bq_client.project}.{Config.BQ_DATASET}.{table_name}"
 
@@ -697,6 +729,7 @@ class CloudStorage(BaseStorage):
             f"⚡ [BigQuery] Bắt đầu đồng bộ phân vùng (Staging Mode) cho bảng {table_name} ngày {date_str}..."
         )
 
+        self._validate_table_name(table_name)
         target_table_ref: str = (
             f"{self.bq_client.project}.{Config.BQ_DATASET}.{table_name}"
         )
@@ -704,6 +737,7 @@ class CloudStorage(BaseStorage):
         run_id: str = uuid.uuid4().hex[:8]
         clean_date_str: str = date_ref.strftime("%Y%m%d")
         staging_table_name: str = f"{table_name}_staging_{clean_date_str}_{run_id}"
+        self._validate_table_name(staging_table_name)
         staging_table_ref: str = (
             f"{self.bq_client.project}.{Config.BQ_DATASET}.{staging_table_name}"
         )
@@ -859,14 +893,13 @@ class CloudStorage(BaseStorage):
             )
             query_job.result()
             self.logger.info(
-                f"🎉 [BigQuery] Hòn tất đồng bộ adjusted_price cho {len(date_strings)} ngày."
+                f"🎉 [BigQuery] Hoàn tất đồng bộ adjusted_price cho {len(date_strings)} ngày."
             )
         except Exception as e:
             self.logger.error(
                 f"❌ [BigQuery] Lỗi đồng bộ adjusted_price số lượng lớn ngày: {e}"
             )
             raise e
-
 
     def read_checkpoint(self) -> dict[str, Any]:
         """Đọc tệp snapshot thị trường EOD được lưu trữ trước đó trên GCS.
@@ -906,36 +939,72 @@ class CloudStorage(BaseStorage):
 
         self.logger.info("⚡ [Snapshot] Đang trích xuất trạng thái thị trường EOD...")
 
-        # Xây dựng cấu trúc JSON snapshot qua phương thức dùng chung trên BaseStorage
-        old_checkpoint: dict[str, Any] = self.read_checkpoint()
-        final_json_structure: dict[str, Any] = self._build_eod_snapshot(
-            df=df,
-            active_symbols=active_symbols,
-            pending_adjusted_reloads=pending_adjusted_reloads,
-            old_checkpoint=old_checkpoint,
-        )
-        final_snapshots: dict[str, Any] = final_json_structure["snapshots"]
+        max_retries: int = 5
+        backoff_delay: float = 0.5
 
-        # Upload JSON trực tiếp lên GCS
-        try:
-            json_str: str = json.dumps(
-                final_json_structure,
-                cls=CustomJSONEncoder,
-                ensure_ascii=False,
-                indent=2,
-            )
-            blob: storage.Blob = self.bucket.blob(Config.GCS_CHECKPOINT_KEY)
-            blob.upload_from_string(json_str, content_type="application/json")
-            self.logger.info(
-                f"☁️ [Snapshot Thành Công] 💾 Đã cập nhật tổng cộng {len(final_snapshots)} mã "
-                f"tại GCS: gs://{Config.GCS_BUCKET_NAME}/{Config.GCS_CHECKPOINT_KEY}"
-            )
-        except Exception as e:
-            self.logger.error(
-                f"🛑 [GCS] Ghi tệp snapshot trạng thái lên GCS thất bại: {e}"
-            )
-        finally:
-            gc.collect()
+        for attempt in range(1, max_retries + 1):
+            try:
+                blob: storage.Blob = self.bucket.blob(Config.GCS_CHECKPOINT_KEY)
+                old_checkpoint: dict[str, Any] = {}
+                generation: int = 0
+
+                try:
+                    blob.reload()
+                    if blob.exists():
+                        generation = blob.generation
+                        json_str = blob.download_as_text(encoding="utf-8")
+                        old_checkpoint = json.loads(json_str)
+                except google.api_core.exceptions.NotFound:
+                    generation = 0
+                except Exception as read_err:
+                    self.logger.warning(
+                        f"⚠️ [GCS] Lỗi khi đọc file checkpoint từ GCS: {read_err}. Khởi tạo mới."
+                    )
+
+                final_json_structure: dict[str, Any] = self._build_eod_snapshot(
+                    df=df,
+                    active_symbols=active_symbols,
+                    pending_adjusted_reloads=pending_adjusted_reloads,
+                    old_checkpoint=old_checkpoint,
+                )
+                final_snapshots: dict[str, Any] = final_json_structure["snapshots"]
+
+                json_str: str = json.dumps(
+                    final_json_structure,
+                    cls=CustomJSONEncoder,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+
+                blob.upload_from_string(
+                    json_str,
+                    content_type="application/json",
+                    if_generation_match=generation,
+                )
+                self.logger.info(
+                    f"☁️ [Snapshot Thành Công] 💾 Đã cập nhật tổng cộng {len(final_snapshots)} mã "
+                    f"tại GCS: gs://{Config.GCS_BUCKET_NAME}/{Config.GCS_CHECKPOINT_KEY}"
+                )
+                return
+            except google.api_core.exceptions.PreconditionFailed:
+                if attempt == max_retries:
+                    self.logger.error(
+                        f"🛑 [GCS] Gặp xung đột Race Condition liên tục khi lưu checkpoint. "
+                        f"Đã thử lại {max_retries} lần nhưng vẫn thất bại."
+                    )
+                    raise
+                self.logger.warning(
+                    f"⚠️ [GCS] Phát hiện xung đột Race Condition khi lưu checkpoint (lần {attempt}/{max_retries}). "
+                    f"Đang thử lại sau {backoff_delay * attempt}s..."
+                )
+                time.sleep(backoff_delay * attempt)
+            except Exception as e:
+                self.logger.error(
+                    f"🛑 [GCS] Ghi tệp snapshot trạng thái lên GCS thất bại: {e}"
+                )
+                raise e
+            finally:
+                gc.collect()
 
     def read_blacklist(self) -> set[str]:
         """Đọc tệp danh sách đen (blacklist.txt) từ GCS, nếu không có hoặc lỗi thì fallback về file cục bộ.
@@ -943,7 +1012,7 @@ class CloudStorage(BaseStorage):
         Returns:
             set[str]: Set chứa các mã chứng khoán viết hoa thuộc danh sách đen.
         """
-        blacklist_key: str = Config.GCS_BLACKLIST_KEY
+        blacklist_key: str = Config.BLACKLIST_PATH_KEY
         blob: storage.Blob = self.bucket.blob(blacklist_key)
 
         if blob.exists():
@@ -966,7 +1035,7 @@ class CloudStorage(BaseStorage):
 
         # Fallback đọc từ file cục bộ
         try:
-            with open(Config.GCS_BLACKLIST_KEY, "r", encoding="utf-8") as file:
+            with open(Config.BLACKLIST_PATH_KEY, "r", encoding="utf-8") as file:
                 blacklist: set[str] = {
                     line.strip().upper()
                     for line in file
@@ -978,7 +1047,7 @@ class CloudStorage(BaseStorage):
                 return blacklist
         except FileNotFoundError:
             self.logger.warning(
-                f"⚠️ [Local] Không tìm thấy file '{Config.GCS_BLACKLIST_KEY}' cục bộ. Bỏ qua bộ lọc danh sách đen."
+                f"⚠️ [Local] Không tìm thấy file '{Config.BLACKLIST_PATH_KEY}' cục bộ. Bỏ qua bộ lọc danh sách đen."
             )
             return set()
 
