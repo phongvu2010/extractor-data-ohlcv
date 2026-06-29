@@ -2,77 +2,16 @@ from datetime import date, datetime
 import logging
 import os
 import re
+from typing import Any
 
 from dotenv import load_dotenv
 import holidays
+from pydantic import Field, PrivateAttr, field_validator, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 import pytz
 
 # Tải trước các biến môi trường từ tệp .env nhằm phục vụ cấu hình động
 load_dotenv()
-
-
-def _get_env_int(key: str, default: int) -> int:
-    """Lấy giá trị cấu hình số nguyên từ biến môi trường.
-
-    Args:
-        key (str): Tên biến môi trường cần lấy.
-        default (int): Giá trị mặc định nếu biến môi trường
-            không tồn tại hoặc lỗi định dạng.
-
-    Returns:
-        int: Giá trị số nguyên tương ứng.
-    """
-    if not isinstance(default, int) or isinstance(default, bool):
-        raise TypeError(
-            f"Default value for {key} must be an int, got {type(default).__name__}"
-        )
-    val: str | None = os.getenv(key)
-    if val is None:
-        return default
-    val = val.strip()
-    if val == "":
-        return default
-    try:
-        return int(val)
-    except ValueError:
-        logger = logging.getLogger(os.getenv("DEFAULT_LOGGER_NAME", "ETL_Pipeline"))
-        logger.warning(
-            f"⚠️ Environment variable '{key}' has value {val!r} which cannot be parsed to an int. "
-            f"Using default value: {default}"
-        )
-        return default
-
-
-def _get_env_float(key: str, default: float) -> float:
-    """Lấy giá trị cấu hình số thực từ biến môi trường.
-
-    Args:
-        key (str): Tên biến môi trường cần lấy.
-        default (float): Giá trị mặc định nếu biến môi trường
-            không tồn tại hoặc lỗi định dạng.
-
-    Returns:
-        float: Giá trị số thực tương ứng.
-    """
-    if not isinstance(default, (int, float)) or isinstance(default, bool):
-        raise TypeError(
-            f"Default value for {key} must be a float or int, got {type(default).__name__}"
-        )
-    val: str | None = os.getenv(key)
-    if val is None:
-        return float(default)
-    val = val.strip()
-    if val == "":
-        return float(default)
-    try:
-        return float(val)
-    except ValueError:
-        logger = logging.getLogger(os.getenv("DEFAULT_LOGGER_NAME", "ETL_Pipeline"))
-        logger.warning(
-            f"⚠️ Environment variable '{key}' has value {val!r} which cannot be parsed to a float. "
-            f"Using default value: {default}"
-        )
-        return float(default)
 
 
 def _get_secret(key: str, default: str = "") -> str:
@@ -96,17 +35,133 @@ def _get_secret(key: str, default: str = "") -> str:
     return os.getenv(key, default)
 
 
-class Config:
-    """Quản lý tập trung toàn bộ cấu hình và hằng số của hệ thống."""
+class Settings(BaseSettings):
+    """Quản lý tập trung toàn bộ cấu hình và hằng số của hệ thống sử dụng Pydantic BaseSettings."""
+
+    # Cấu hình nạp dữ liệu môi trường qua Pydantic Settings
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        arbitrary_types_allowed=True,
+    )
 
     # Thiết lập múi giờ Việt Nam để đồng bộ thời gian giao dịch sàn nội địa
-    VN_TZ: pytz.tzinfo.BaseTzInfo = pytz.timezone("Asia/Ho_Chi_Minh")
+    VN_TZ: pytz.tzinfo.BaseTzInfo = Field(
+        default_factory=lambda: pytz.timezone("Asia/Ho_Chi_Minh")
+    )
 
-    _cached_year: int | None = None
-    _cached_holidays: list[str] | None = None
+    # Các thuộc tính private để lưu vết cache ngày nghỉ lễ Việt Nam
+    _cached_year: int | None = PrivateAttr(default=None)
+    _cached_holidays: list[str] | None = PrivateAttr(default=None)
 
+    # Môi trường chạy hệ thống (cloud / local)
+    DEPLOYMENT_ENV: str = Field(default="cloud")
+    DATABASE_URL: str = Field(default="")
+
+    # Cấu hình Google Cloud Storage (GCS)
+    GCS_BUCKET_NAME: str = Field(default="vn-stock")
+    GCS_CHECKPOINT_KEY: str = Field(default="checkpoints/latest_state.json")
+    GCS_PARQUET_PREFIX: str = Field(default="market_data")
+    BLACKLIST_PATH_KEY: str = Field(default="configs/blacklist.txt")
+
+    # Cấu hình Google Cloud BigQuery (BQ)
+    BQ_DATASET: str = Field(default="vn_stock_dataset")
+    BQ_RAW_TABLE: str = Field(default="raw_price")
+    BQ_ADJ_TABLE: str = Field(default="adj_price")
+
+    # Các hằng số hệ thống cố định
+    URL_CAFEF: str = Field(default="https://cafef1.mediacdn.vn/data/ami_data/")
+    URL_EVENTS: str = Field(
+        default="https://iq.vietcap.com.vn/api/iq-insight-service/v1/events"
+    )
+    NETWORK_TIMEOUT: int = Field(default=30)
+    PRICE_MULTIPLIER: int = Field(default=1000)
+    CHUNK_SIZE: int = Field(default=150000)
+    DEFAULT_LOGGER_NAME: str = Field(default="ETL_Pipeline")
+    API_REQUEST_THRESHOLD: int = Field(default=18)
+    API_RATE_LIMIT_WINDOW: float = Field(default=60.0)
+    API_MICRO_SLEEP: float = Field(default=3.5)
+
+    # Cấu hình vnstock API nguồn mặc định và dự phòng
+    VNSTOCK_DEFAULT_SOURCE: str = Field(default="VCI")
+
+    # Cảnh báo qua Telegram (Hỗ trợ Secret Manager hoặc fallback sang env)
+    TELEGRAM_BOT_TOKEN: str = Field(default="")
+    TELEGRAM_CHAT_ID: str = Field(default="")
+
+    # Cấu hình bỏ qua các chốt chặn ngày nghỉ (cuối tuần / lễ) khi cần chạy ép buộc
+    FORCE_RUN: bool = Field(default=False)
+
+    # Cấu hình ngày bắt đầu tải lịch sử mặc định khi reload giá điều chỉnh
+    HISTORICAL_START_DATE: str = Field(default="2000-01-01")
+
+    # Cấu hình giờ chốt phiên EOD (giờ và phút)
+    EOD_HOUR: int = Field(default=16)
+    EOD_MINUTE: int = Field(default=30)
+
+    # Danh sách mã cổ phiếu benchmark kiểm định đơn vị giá
+    BENCHMARK_TICKERS: list[str] = Field(
+        default_factory=lambda: ["FPT", "HPG", "VNM", "VIC"]
+    )
+
+    # Cấu hình kích thước lô (batch size) khi tải bảng giá T0 và reload giá điều chỉnh
+    PRICE_BOARD_BATCH_SIZE: int = Field(default=500)
+    RELOAD_BATCH_SIZE: int = Field(default=10)
+
+    # Ngưỡng phát hiện lỗi nghiêm trọng liên tiếp khi tải ohlcv
+    CRITICAL_FAILURE_THRESHOLD: int = Field(default=5)
+
+    # Kích thước lô ghi dữ liệu (Bulk Upsert) vào cơ sở dữ liệu
+    DB_UPSERT_CHUNK_SIZE: int = Field(default=5000)
+
+    # Cấu hình bổ sung ngày nghỉ lễ qua biến môi trường (dạng YYYY-MM-DD, cách nhau bởi dấu phẩy)
+    CUSTOM_HOLIDAYS: str = Field(default="")
+
+    @field_validator("DEPLOYMENT_ENV", mode="before")
     @classmethod
-    def get_vn_holiday_dates(cls) -> list[str]:
+    def clean_deployment_env(cls, v: Any) -> str:
+        if isinstance(v, str):
+            return v.strip().lower()
+        return v
+
+    @field_validator("HISTORICAL_START_DATE", mode="before")
+    @classmethod
+    def clean_historical_start_date(cls, v: Any) -> str:
+        if isinstance(v, str):
+            return v.strip()
+        return v
+
+    @field_validator("BENCHMARK_TICKERS", mode="before")
+    @classmethod
+    def parse_benchmark_tickers(cls, v: Any) -> list[str]:
+        if isinstance(v, str):
+            return [t.strip().upper() for t in v.split(",") if t.strip()]
+        if isinstance(v, list):
+            return [str(t).strip().upper() for t in v if str(t).strip()]
+        return v
+
+    @model_validator(mode="before")
+    @classmethod
+    def load_secrets(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            # Check secret files from Secret Manager (/secrets/<SECRET_NAME>) first
+            for key in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
+                secret_path = f"/secrets/{key}"
+                if os.path.exists(secret_path):
+                    try:
+                        with open(secret_path, "r", encoding="utf-8") as f:
+                            data[key] = f.read().strip()
+                            continue
+                    except OSError:
+                        pass
+                # Nếu không có file và cũng chưa được định nghĩa trong data nạp từ env/dotenv,
+                # thực hiện fallback lấy trực tiếp từ os.getenv
+                if key not in data or data[key] is None:
+                    data[key] = os.getenv(key, "")
+        return data
+
+    def get_vn_holiday_dates(self) -> list[str]:
         """Lấy danh sách các ngày nghỉ lễ của Việt Nam.
 
         Kết hợp ngày lễ quốc gia và cấu hình thủ công qua
@@ -115,16 +170,16 @@ class Config:
         Returns:
             list[str]: Danh sách ngày nghỉ lễ định dạng YYYY-MM-DD.
         """
-        current_year: int = datetime.now(cls.VN_TZ).year
-        if cls._cached_year != current_year or cls._cached_holidays is None:
+        current_year: int = datetime.now(self.VN_TZ).year
+        if self._cached_year != current_year or self._cached_holidays is None:
             # Xác định lịch nghỉ lễ Việt Nam xung quanh năm hiện hành để lọc ngày đóng cửa thị trường
             vn_holidays_obj: holidays.HolidayBase = holidays.country_holidays(
                 "VN", years=[current_year - 1, current_year, current_year + 1]
             )
 
             # Danh sách ngày nghỉ lễ bổ sung được cấu hình thủ công qua
-            # biến môi trường (dạng YYYY-MM-DD, cách nhau bởi dấu phẩy)
-            custom_holidays_raw: str = os.getenv("CUSTOM_HOLIDAYS", "")
+            # biến môi trường/cấu hình (dạng YYYY-MM-DD, cách nhau bởi dấu phẩy)
+            custom_holidays_raw: str = self.CUSTOM_HOLIDAYS or ""
             custom_holiday_list: list[str] = []
             for d in custom_holidays_raw.split(","):
                 d_clean: str = d.strip()
@@ -138,91 +193,23 @@ class Config:
                     ).date()
                     custom_holiday_list.append(valid_date.strftime("%Y-%m-%d"))
                 except ValueError:
-                    logger = logging.getLogger(cls.DEFAULT_LOGGER_NAME)
+                    logger = logging.getLogger(self.DEFAULT_LOGGER_NAME)
                     logger.warning(
                         f"Environment variable 'CUSTOM_HOLIDAYS' contains invalid entry {d_clean!r}. "
                         "Expected format: YYYY-MM-DD. Ignoring this entry."
                     )
 
-            cls._cached_holidays = sorted(
+            self._cached_holidays = sorted(
                 list(
                     set(
                         [str(dt) for dt in vn_holidays_obj.keys()] + custom_holiday_list
                     )
                 )
             )
-            cls._cached_year = current_year
-        return cls._cached_holidays
+            self._cached_year = current_year
+        return self._cached_holidays
 
-    # Môi trường chạy hệ thống (cloud / local)
-    DEPLOYMENT_ENV: str = os.getenv("DEPLOYMENT_ENV", "cloud").strip().lower()
-    DATABASE_URL: str = os.getenv("DATABASE_URL", "")
-
-    # Cấu hình Google Cloud Storage (GCS)
-    GCS_BUCKET_NAME: str = os.getenv("GCS_BUCKET_NAME", "vn-stock")
-    GCS_CHECKPOINT_KEY: str = os.getenv(
-        "GCS_CHECKPOINT_KEY", "checkpoints/latest_state.json"
-    )
-    GCS_PARQUET_PREFIX: str = os.getenv("GCS_PARQUET_PREFIX", "market_data")
-    BLACKLIST_PATH_KEY: str = os.getenv("BLACKLIST_PATH_KEY", "configs/blacklist.txt")
-
-    # Cấu hình Google Cloud BigQuery (BQ)
-    BQ_DATASET: str = os.getenv("BQ_DATASET", "vn_stock_dataset")
-    BQ_RAW_TABLE: str = os.getenv("BQ_RAW_TABLE", "raw_price")
-    BQ_ADJ_TABLE: str = os.getenv("BQ_ADJ_TABLE", "adjusted_price")
-
-    # Các hằng số hệ thống cố định
-    URL_CAFEF: str = os.getenv("URL_CAFEF", "https://cafef1.mediacdn.vn/data/ami_data/")
-    URL_EVENTS: str = os.getenv(
-        "URL_EVENTS",
-        "https://iq.vietcap.com.vn/api/iq-insight-service/v1/events",
-    )
-    NETWORK_TIMEOUT: int = _get_env_int("NETWORK_TIMEOUT", 30)
-    PRICE_MULTIPLIER: int = _get_env_int("PRICE_MULTIPLIER", 1000)
-    CHUNK_SIZE: int = _get_env_int("CHUNK_SIZE", 150000)
-    DEFAULT_LOGGER_NAME: str = os.getenv("DEFAULT_LOGGER_NAME", "ETL_Pipeline")
-    API_REQUEST_THRESHOLD: int = _get_env_int("API_REQUEST_THRESHOLD", 18)
-    API_RATE_LIMIT_WINDOW: float = _get_env_float("API_RATE_LIMIT_WINDOW", 60.0)
-    API_MICRO_SLEEP: float = _get_env_float("API_MICRO_SLEEP", 3.5)
-
-    # Cấu hình vnstock API nguồn mặc định và dự phòng
-    VNSTOCK_DEFAULT_SOURCE: str = os.getenv("VNSTOCK_DEFAULT_SOURCE", "VCI")
-
-    # Cảnh báo qua Telegram (Hỗ trợ Secret Manager mount file bí mật hoặc fallback sang env)
-    TELEGRAM_BOT_TOKEN: str = _get_secret("TELEGRAM_BOT_TOKEN", "")
-    TELEGRAM_CHAT_ID: str = _get_secret("TELEGRAM_CHAT_ID", "")
-
-    # Cấu hình bỏ qua các chốt chặn ngày nghỉ (cuối tuần / lễ) khi cần chạy ép buộc
-    FORCE_RUN: bool = os.getenv("FORCE_RUN", "false").lower() == "true"
-
-    # Cấu hình ngày bắt đầu tải lịch sử mặc định khi reload giá điều chỉnh
-    HISTORICAL_START_DATE: str = os.getenv(
-        "HISTORICAL_START_DATE", "2000-01-01"
-    ).strip()
-
-    # Cấu hình giờ chốt phiên EOD (giờ và phút)
-    EOD_HOUR: int = _get_env_int("EOD_HOUR", 16)
-    EOD_MINUTE: int = _get_env_int("EOD_MINUTE", 30)
-
-    # Danh sách mã cổ phiếu benchmark kiểm định đơn vị giá
-    BENCHMARK_TICKERS: list[str] = [
-        t.strip().upper()
-        for t in os.getenv("BENCHMARK_TICKERS", "FPT,HPG,VNM,VIC").split(",")
-        if t.strip()
-    ]
-
-    # Cấu hình kích thước lô (batch size) khi tải bảng giá T0 và reload giá điều chỉnh
-    PRICE_BOARD_BATCH_SIZE: int = _get_env_int("PRICE_BOARD_BATCH_SIZE", 500)
-    RELOAD_BATCH_SIZE: int = _get_env_int("RELOAD_BATCH_SIZE", 10)
-
-    # Ngưỡng phát hiện lỗi nghiêm trọng liên tiếp khi tải ohlcv
-    CRITICAL_FAILURE_THRESHOLD: int = _get_env_int("CRITICAL_FAILURE_THRESHOLD", 5)
-
-    # Kích thước lô ghi dữ liệu (Bulk Upsert) vào cơ sở dữ liệu
-    DB_UPSERT_CHUNK_SIZE: int = _get_env_int("DB_UPSERT_CHUNK_SIZE", 5000)
-
-    @classmethod
-    def validate_config(cls) -> None:
+    def validate_config(self) -> None:
         """Kiểm tra cấu hình hệ thống và đưa ra các cảnh báo cần thiết.
 
         Kiểm tra xem các biến môi trường quan trọng như DATABASE_URL (cho local)
@@ -230,28 +217,28 @@ class Config:
         kiểm định thông tin Telegram cấu hình và tính hợp lệ của các mã benchmark.
         """
         missing_critical: list[str] = []
-        if cls.DEPLOYMENT_ENV == "local":
-            if not cls.DATABASE_URL:
+        if self.DEPLOYMENT_ENV == "local":
+            if not self.DATABASE_URL:
                 missing_critical.append("DATABASE_URL")
-        elif cls.DEPLOYMENT_ENV == "cloud":
-            if not cls.GCS_BUCKET_NAME:
+        elif self.DEPLOYMENT_ENV == "cloud":
+            if not self.GCS_BUCKET_NAME:
                 missing_critical.append("GCS_BUCKET_NAME")
-            if not cls.BQ_DATASET:
+            if not self.BQ_DATASET:
                 missing_critical.append("BQ_DATASET")
 
-        logger = logging.getLogger(cls.DEFAULT_LOGGER_NAME)
+        logger = logging.getLogger(self.DEFAULT_LOGGER_NAME)
         if missing_critical:
             error_msg: str = (
                 f"🛑 [Cấu hình] Thiếu các biến môi trường quan trọng cho "
-                f"chế độ '{cls.DEPLOYMENT_ENV}': {', '.join(missing_critical)}. "
+                f"chế độ '{self.DEPLOYMENT_ENV}': {', '.join(missing_critical)}. "
                 f"Không thể khởi chạy hệ thống."
             )
             logger.error(error_msg)
             raise ValueError(error_msg)
 
         # Cảnh báo nếu cấu hình Telegram bị thiếu 1 trong 2 trường
-        if (cls.TELEGRAM_BOT_TOKEN and not cls.TELEGRAM_CHAT_ID) or (
-            cls.TELEGRAM_CHAT_ID and not cls.TELEGRAM_BOT_TOKEN
+        if (self.TELEGRAM_BOT_TOKEN and not self.TELEGRAM_CHAT_ID) or (
+            self.TELEGRAM_CHAT_ID and not self.TELEGRAM_BOT_TOKEN
         ):
             logger.warning(
                 "⚠️ [Cấu hình] Thiếu TELEGRAM_BOT_TOKEN hoặc "
@@ -261,7 +248,7 @@ class Config:
 
         # Kiểm định định dạng các mã benchmark
         valid_benchmarks: list[str] = []
-        for ticker in cls.BENCHMARK_TICKERS:
+        for ticker in self.BENCHMARK_TICKERS:
             if re.match(r"^[A-Z0-9]{3,10}$", ticker):
                 valid_benchmarks.append(ticker)
             else:
@@ -272,6 +259,10 @@ class Config:
             logger.warning(
                 "⚠️ [Cấu hình] Không có mã benchmark nào hợp lệ. Sử dụng danh sách mặc định ['FPT', 'HPG', 'VNM', 'VIC']."
             )
-            cls.BENCHMARK_TICKERS = ["FPT", "HPG", "VNM", "VIC"]
+            self.BENCHMARK_TICKERS = ["FPT", "HPG", "VNM", "VIC"]
         else:
-            cls.BENCHMARK_TICKERS = valid_benchmarks
+            self.BENCHMARK_TICKERS = valid_benchmarks
+
+
+# Tạo instance duy nhất của cấu hình để import và sử dụng trong toàn bộ hệ thống
+Config = Settings()

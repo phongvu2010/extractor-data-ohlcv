@@ -37,6 +37,8 @@ holidays>=0.45
 # Cấu hình, Logging & Tiện ích
 python-dotenv>=1.0.0
 rich>=13.0.0
+pydantic>=2.10.0
+pydantic-settings>=2.1.0
 
 # # Database & ORM
 # SQLAlchemy==2.0.31
